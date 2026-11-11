@@ -13,6 +13,7 @@ import forge.media.pocket.discovery.DiscoveredMediaCandidate
 import forge.media.pocket.discovery.DiscoveredSpamChannel
 import forge.media.pocket.discovery.HuntPlatform
 import forge.media.pocket.discovery.SearchDurationMode
+import forge.media.pocket.discovery.SearchLanguageMode
 import forge.media.pocket.discovery.SearchTimePeriod
 import forge.media.pocket.discovery.TopicHunterEngine
 import forge.media.pocket.service.PipelineForegroundService
@@ -59,6 +60,7 @@ data class PendingHuntFilterState(
     var sortOrder: ContentSortOrder = ContentSortOrder.RELEVANCE,
     var period: SearchTimePeriod = SearchTimePeriod.MONTH,
     var durationMode: SearchDurationMode = SearchDurationMode.ANY_UP_TO_6M,
+    var languageMode: SearchLanguageMode = SearchLanguageMode.RUSSIAN_ONLY,
     var count: Int = 6
 )
 
@@ -467,19 +469,20 @@ class TelegramBotWorker(
 
     private suspend fun sendQuickTopicPicker(chatId: Long) {
         val text = "🧠 Опиши в чат ЛЮБУЮ тематику своими словами (в свободной форме)!\n\n" +
-            "Например:\n" +
-            "• «смешные истории комиков про отношения, бывших или свидания»\n" +
-            "• «подкаст с учёным где простыми словами рассказывают про космос или мозг»\n" +
-            "• «жесткие клатчи в кс2 с реакцией комментаторов»\n\n" +
+            "• При запросе стендапа (рассказы / диалоги / истории) бот АВТОМАТИЧЕСКИ подключит смежные запросы («стендап монологи», «стендапы о жизни», «стендап истории», «импровизация с залом») + популярных современных комиков + живые подсказки YouTube.\n" +
+            "• Можно искать строго на русском 🇷🇺 или переключить на 🇺🇸 Английский специально под переозвучку в Студии!\n\n" +
             "Или нажми на одну из готовых кнопок ниже:"
         val keyboard = InlineKeyboardMarkup(
             inlineKeyboard = listOf(
                 listOf(
-                    InlineKeyboardButton("😂 Истории комиков про работу/жизнь", "quick_hunt:смешные истории комиков стендап про работу и жизнь"),
-                    InlineKeyboardButton("🎙 Интересные мысли из подкастов", "quick_hunt:интересная мысль история из подкаста интервью")
+                    InlineKeyboardButton("😂 Стендап: монологи и истории о жизни", "quick_hunt:стендап рассказы монологи о жизни истории комиков"),
+                    InlineKeyboardButton("🇺🇸 EN Стендап (под переозвучку)", "quick_hunt_en:standup comedy stories crowd work monologue")
                 ),
                 listOf(
-                    InlineKeyboardButton("🎮 Эпичные моменты CS2", "quick_hunt:лучшие моменты клатчи cs2 киберспорт"),
+                    InlineKeyboardButton("🎙 Интересные мысли из подкастов", "quick_hunt:интересная мысль история из подкаста интервью"),
+                    InlineKeyboardButton("🎮 Эпичные моменты CS2", "quick_hunt:лучшие моменты клатчи cs2 киберспорт")
+                ),
+                listOf(
                     InlineKeyboardButton("🧪 Научпоп: космос и физика", "quick_hunt:научпоп интересные факты космос физика простыми словами")
                 )
             )
@@ -487,7 +490,11 @@ class TelegramBotWorker(
         sendMessageWithKeyboard(chatId, text, keyboard)
     }
 
-    private suspend fun handleHuntCommand(chatId: Long, rawText: String) {
+    private suspend fun handleHuntCommand(
+        chatId: Long,
+        rawText: String,
+        defaultLanguage: SearchLanguageMode = SearchLanguageMode.RUSSIAN_ONLY
+    ) {
         val queryRaw = rawText.removePrefix("/hunt").trim()
         if (queryRaw.isBlank()) {
             sendQuickTopicPicker(chatId)
@@ -496,7 +503,19 @@ class TelegramBotWorker(
 
         val huntId = UUID.randomUUID().toString().take(6)
         val cleanQuery = queryRaw.replace("#", " ").replace(Regex("""\s+"""), " ").trim()
-        val state = PendingHuntFilterState(queryTags = cleanQuery)
+        val autoDetectedLang = if (
+            defaultLanguage == SearchLanguageMode.RUSSIAN_ONLY &&
+            cleanQuery.any { it in 'a'..'z' || it in 'A'..'Z' } &&
+            !cleanQuery.any { it in 'а'..'я' || it in 'А'..'Я' || it == 'ё' || it == 'Ё' }
+        ) {
+            SearchLanguageMode.ENGLISH_FOR_DUB
+        } else {
+            defaultLanguage
+        }
+        val state = PendingHuntFilterState(
+            queryTags = cleanQuery,
+            languageMode = autoDetectedLang
+        )
         huntFilters[huntId] = state
 
         sendHuntConfiguratorMessage(chatId, huntId, state)
@@ -507,21 +526,24 @@ class TelegramBotWorker(
         huntId: String,
         state: PendingHuntFilterState
     ) {
-        val aiActive = configStore.getGeminiApiKey().isNotBlank()
         val text = buildString {
             append("🧠 Запрос в свободной форме:\n«").append(state.queryTags).append("»\n\n")
-            append("• Умный AI-анализ Gemini: ").append(if (aiActive) "🟢 ВКЛ (Подбор запросов + Выжимка «Что внутри»)" else "⚪ ВЫКЛ (обычный поиск)").append("\n")
+            append("• Авто-расширение темы: 🟢 ВКЛ (Синонимы + Комики + Автоподсказки YouTube + AI)\n")
+            append("• Язык видео: ").append(state.languageMode.label).append("\n")
             append("• Тип видео: ").append(state.durationMode.label).append("\n")
             append("• Сортировка: ").append(state.sortOrder.label).append("\n")
-            append("• Период: ").append(state.period.label).append("\n")
+            append("• Период загрузки: ").append(state.period.label).append(" (жесткий фильтр YouTube)\n")
             append("• Сколько роликов отобрать: ").append(state.count).append(" шт.\n\n")
-            append("👇 Жми зелёную кнопку — я найду подходящие видео, сделаю краткую выжимку «Что внутри» и пришлю ссылки:")
+            append("👇 Жми зелёную кнопку — я найду свежие видео по теме, отсею старые архивы и чужие языки, сделаю выжимку «Что внутри» и пришлю ссылки:")
         }
 
         val keyboard = InlineKeyboardMarkup(
             inlineKeyboard = listOf(
                 listOf(
                     InlineKeyboardButton("🚀 Найти и сделать выжимку (${state.count} шт.)", "hunt_go:$huntId")
+                ),
+                listOf(
+                    InlineKeyboardButton("Язык: ${state.languageMode.label}", "hunt_lang:$huntId")
                 ),
                 listOf(
                     InlineKeyboardButton("Тип: ${state.durationMode.label}", "hunt_dur:$huntId")
@@ -555,14 +577,9 @@ class TelegramBotWorker(
     }
 
     private suspend fun executeTagSearchAndSendLinks(chatId: Long, state: PendingHuntFilterState) {
-        val aiActive = configStore.getGeminiApiKey().isNotBlank()
         sendMessage(
             chatId,
-            if (aiActive) {
-                "🧠 Gemini анализирует твою тему «${state.queryTags}», генерирует поисковые запросы и отбирает ${state.count} лучших видео с выжимкой «Что внутри»..."
-            } else {
-                "🔎 Ищу ${state.count} видео по теме «${state.queryTags}» (${state.durationMode.label})..."
-            }
+            "🔎 Расширяю тему «${state.queryTags}» (подключаю популярные похожие запросы, комиков/авторов и автоподсказки YouTube), язык: ${state.languageMode.label}, период: ${state.period.label}..."
         )
 
         enqueueHardwareTask("search", "AI Smart Search for '${state.queryTags}'") {
@@ -573,13 +590,14 @@ class TelegramBotWorker(
                     sortOrder = state.sortOrder,
                     period = state.period,
                     durationMode = state.durationMode,
+                    languageMode = state.languageMode,
                     limitCount = state.count
                 )
 
                 if (candidates.isEmpty()) {
                     sendMessage(
                         chatId,
-                        "⚠️ По теме «${state.queryTags}» подходящих видео не найдено. Попробуй переключить «Тип видео» или сформулировать тему иначе."
+                        "⚠️ По теме «${state.queryTags}» за период «${state.period.label}» подходящих видео не найдено. Попробуй переключить «Период» (например на За год / За всё время) или «Язык»."
                     )
                     return@enqueueHardwareTask
                 }
@@ -967,7 +985,11 @@ class TelegramBotWorker(
                 return
             }
             "quick_hunt" -> {
-                handleHuntCommand(chatId, targetId)
+                handleHuntCommand(chatId, targetId, SearchLanguageMode.RUSSIAN_ONLY)
+                return
+            }
+            "quick_hunt_en" -> {
+                handleHuntCommand(chatId, targetId, SearchLanguageMode.ENGLISH_FOR_DUB)
                 return
             }
             "spam_quick" -> {
@@ -1261,6 +1283,11 @@ class TelegramBotWorker(
                 return
             }
             when (action) {
+                "hunt_lang" -> {
+                    val values = SearchLanguageMode.entries
+                    filterState.languageMode = values[(filterState.languageMode.ordinal + 1) % values.size]
+                    sendHuntConfiguratorMessage(chatId, targetId, filterState)
+                }
                 "hunt_dur" -> {
                     val values = SearchDurationMode.entries
                     filterState.durationMode = values[(filterState.durationMode.ordinal + 1) % values.size]

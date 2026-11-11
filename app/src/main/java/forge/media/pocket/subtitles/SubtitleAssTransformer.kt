@@ -618,7 +618,46 @@ class SubtitleAssTransformer(
                 rawTranscriptSegment.ifBlank { "Не удалось извлечь речь — введите текст озвучки вручную." }
             }
         } catch (e: Exception) {
-            DiagnosticLogger.logError("DUB-SCRIPT", "Ошибка генерации скрипта переозвучки", e)
+            DiagnosticLogger.logError("DUB-SCRIPT", "Прямой вызов Gemini недоступен (${e.message?.take(60)}), пробуем резервный перевод без VPN...", e)
+            if (rawTranscriptSegment.isNotBlank()) {
+                try {
+                    val fallbackPayload = buildJsonObject {
+                        put("model", "openai")
+                        put(
+                            "messages",
+                            buildJsonArray {
+                                add(
+                                    buildJsonObject {
+                                        put(
+                                            "role",
+                                            "system"
+                                        )
+                                        put(
+                                            "content",
+                                            "Ты — автор закадровой русской озвучки для Shorts/Reels. Переведи (если текст на английском) или перескажи своими словами на живом русском языке для диктора (~$targetWordCount слов). Верни ТОЛЬКО готовый русский текст без пояснений."
+                                        )
+                                    }
+                                )
+                                add(
+                                    buildJsonObject {
+                                        put("role", "user")
+                                        put("content", rawTranscriptSegment.take(3500))
+                                    }
+                                )
+                            }
+                        )
+                    }
+                    val fallbackText = httpClient.post("https://text.pollinations.ai/") {
+                        contentType(ContentType.Application.Json)
+                        setBody(fallbackPayload.toString())
+                    }.bodyAsText().trim()
+                    if (fallbackText.length >= 15) {
+                        DiagnosticLogger.log("DUB-SCRIPT", "✅ Скрипт переозвучки переведён через резервный AI-шлюз (${fallbackText.length} симв.)")
+                        return@withContext fallbackText
+                    }
+                } catch (_: Exception) {
+                }
+            }
             rawTranscriptSegment.ifBlank { "Ошибка Gemini: ${e.message?.take(100)}" }
         } finally {
             tempAudio.delete()
