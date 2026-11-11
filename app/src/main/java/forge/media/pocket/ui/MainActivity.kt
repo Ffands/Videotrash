@@ -1706,7 +1706,7 @@ class MainActivity : AppCompatActivity() {
                 if (isPreviewPass) {
                     val kb = renderedFile.length() / 1024
                     studioRenderStatusView.text = "✅ 5-сек тест готов ($kb KB)! Воспроизвожу в плеере сверху."
-                    playFileInStudioPlayer(renderedFile, "5-сек Тест (${config.layoutLayer.label})")
+                    playFileInStudioPlayer(renderedFile, "5-сек Тест (${initialConfig.layoutLayer.label})")
                 } else {
                     val savedGalleryFile = hardwareEngine.saveRenderedVideoToGallery(renderedFile, item.title)
                     lastRenderedGalleryFile = savedGalleryFile

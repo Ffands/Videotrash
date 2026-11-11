@@ -928,9 +928,9 @@ class SubtitleAssTransformer(
                 val rawResp = httpClient.post(endpoint) {
                     contentType(ContentType.Application.Json)
                     setBody(payload.toString())
-                }.body<GeminiResponse>()
+                }.body<GeminiGenerateResponse>()
 
-                val text = rawResp.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text.orEmpty()
+                val text = rawResp.candidates.firstOrNull()?.content?.parts?.firstOrNull()?.text.orEmpty()
                 for (line in text.lines()) {
                     val trimmed = line.trim()
                     when {
