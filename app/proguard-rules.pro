@@ -1,0 +1,6 @@
+-keep class com.arthenica.ffmpegkit.** { *; }
+-keep class com.yausername.** { *; }
+-keep class com.google.mlkit.** { *; }
+-keepattributes *Annotation*, InnerClasses, Signature
+-dontwarn java.awt.**
+-dontwarn javax.naming.**

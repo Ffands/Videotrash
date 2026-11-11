@@ -1,0 +1,52 @@
+name: Build Pocket Media Forge APK
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  assemble-arm64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Download FFmpegKit Full-GPL 6.0-2.LTS AAR (Option 1B Verified Mirror)
+        run: |
+          mkdir -p app/libs
+          curl -L --fail --retry 3 --retry-delay 5 \
+            -o app/libs/ffmpeg-kit-full-gpl-6.0-2.LTS.aar \
+            "https://github.com/BLAM-PTY-LTD/ffmpeg-kit-binaries/releases/download/v6.0.2/ffmpeg-kit-full-gpl.aar"
+          ls -lh app/libs/ffmpeg-kit-full-gpl-6.0-2.LTS.aar
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.9'
+
+      - name: Build Release APK (ARM64-v8a Self-Contained)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+        run: gradle assembleRelease --stacktrace --no-daemon
+
+      - name: Upload Compiled APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketMediaForge-arm64-v8a-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14

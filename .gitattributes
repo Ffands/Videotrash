@@ -1,0 +1,8 @@
+# Mark AI Studio web preview wrapper files as vendored so GitHub Linguist reports 100% Kotlin
+src/** linguist-vendored
+index.html linguist-vendored
+package.json linguist-vendored
+tsconfig.json linguist-vendored
+vite.config.ts linguist-vendored
+bun.lock linguist-vendored
+metadata.json linguist-vendored
