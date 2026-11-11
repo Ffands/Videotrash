@@ -3,12 +3,14 @@ package forge.media.pocket.telegram
 import android.content.Context
 import android.os.Environment
 import android.util.Log
+import com.yausername.youtubedl_android.YoutubeDL
 import forge.media.pocket.clutter.ClutterEntropyFilter
 import forge.media.pocket.compositor.AdInsertionMode
 import forge.media.pocket.compositor.AdLayerConfig
 import forge.media.pocket.compositor.FFmpegHardwareEngine
 import forge.media.pocket.compositor.ModularRenderConfig
 import forge.media.pocket.compositor.VideoLayoutLayer
+import forge.media.pocket.config.DiagnosticLogger
 import forge.media.pocket.config.NodeConfigStore
 import forge.media.pocket.discovery.AutopilotTagSubscription
 import forge.media.pocket.discovery.ContentSortOrder
@@ -34,11 +36,13 @@ import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.ContentType
 import io.ktor.http.Headers
 import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import io.ktor.utils.io.jvm.javaio.copyTo
 import io.ktor.utils.io.jvm.javaio.toByteReadChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -46,6 +50,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -99,6 +104,7 @@ class TelegramBotWorker(
         private const val BTN_MENU_LINK = "🎬 Собрать по ссылке"
         private const val BTN_MENU_AUTO = "🤖 Автопилот"
         private const val BTN_MENU_STATUS = "📊 Статус и Фон"
+        private const val BTN_MENU_LOG = "📜 Полный лог"
     }
 
     private val isPolling = AtomicBoolean(false)
@@ -148,7 +154,25 @@ class TelegramBotWorker(
     private data class TgMessage(
         @SerialName("message_id") val messageId: Long,
         val chat: TgChat,
-        val text: String? = null
+        val text: String? = null,
+        val document: TgDocument? = null
+    )
+
+    @Serializable
+    private data class TgDocument(
+        @SerialName("file_id") val fileId: String,
+        @SerialName("file_name") val fileName: String? = null
+    )
+
+    @Serializable
+    private data class TgGetFileResponse(
+        val ok: Boolean = false,
+        val result: TgFilePathObj? = null
+    )
+
+    @Serializable
+    private data class TgFilePathObj(
+        @SerialName("file_path") val filePath: String? = null
     )
 
     @Serializable
@@ -189,7 +213,8 @@ class TelegramBotWorker(
     private val persistentMainMenuKeyboard = ReplyKeyboardMarkup(
         keyboard = listOf(
             listOf(KeyboardButton(BTN_MENU_HUNT), KeyboardButton(BTN_MENU_LINK)),
-            listOf(KeyboardButton(BTN_MENU_AUTO), KeyboardButton(BTN_MENU_STATUS))
+            listOf(KeyboardButton(BTN_MENU_AUTO), KeyboardButton(BTN_MENU_STATUS)),
+            listOf(KeyboardButton(BTN_MENU_LOG))
         ),
         resizeKeyboard = true,
         isPersistent = true
@@ -205,16 +230,15 @@ class TelegramBotWorker(
 
     fun startPolling(scope: CoroutineScope) {
         if (configStore.getTelegramBotToken().isBlank()) {
-            Log.w(TAG, "TELEGRAM_BOT_TOKEN is empty; waiting for user input in MainActivity.")
+            DiagnosticLogger.log("TELEGRAM", "TELEGRAM_BOT_TOKEN пуст — поллинг не запущен.")
             return
         }
         if (!isPolling.compareAndSet(false, true)) return
 
-        // Start warming up the background clutter pool immediately in the background
         clutterFilter.triggerBackgroundPoolWarmupIfNeeded()
 
         pollingJob = scope.launch(Dispatchers.IO) {
-            Log.i(TAG, "Started Telegram Long-Polling controller")
+            DiagnosticLogger.log("TELEGRAM", "Запущен цикл Long-Polling Telegram API")
             while (isActive && isPolling.get()) {
                 try {
                     val response: TgUpdatesResponse = httpClient.get("${baseUrl()}/getUpdates") {
@@ -250,17 +274,31 @@ class TelegramBotWorker(
         incomingMsg?.let { msg ->
             val chatId = msg.chat.id
             if (!isChatAuthorized(chatId)) {
-                Log.w(TAG, "Ignored message from unauthorized chatId=$chatId")
+                DiagnosticLogger.log("TELEGRAM", "Игнорировано сообщение от чужого chatId=$chatId")
                 return
             }
 
-            val text = msg.text?.trim() ?: return
             if (autopilotChatId == 0L) autopilotChatId = chatId
 
+            // Check if user uploaded a cookies.txt file
+            msg.document?.let { doc ->
+                val fName = doc.fileName ?: "file"
+                if (fName.endsWith(".txt", ignoreCase = true)) {
+                    handleCookiesDocumentUpload(chatId, doc)
+                    return
+                }
+            }
+
+            val text = msg.text?.trim() ?: return
+            DiagnosticLogger.log("TELEGRAM:IN", "Получено сообщение от $chatId: '$text'")
+
             when {
-                // 1. Start / Help / Bottom Menu buttons
                 text == "/start" || text == "/help" || text == "/menu" -> {
                     sendWelcomeMenu(chatId)
+                }
+
+                text == BTN_MENU_LOG || text.startsWith("/log") -> {
+                    sendFullDiagnosticLog(chatId)
                 }
 
                 text == BTN_MENU_STATUS || text.startsWith("/status") -> {
@@ -282,18 +320,15 @@ class TelegramBotWorker(
                     handleAutotagsCommand(scope, chatId, text)
                 }
 
-                // 2. Direct URL anywhere in the message -> immediately process it!
                 text.contains("http://") || text.contains("https://") ||
                     text.startsWith("/clip") || text.startsWith("/process") -> {
                     handleIncomingJobCommand(chatId, text)
                 }
 
-                // 3. Explicit /hunt command
                 text.startsWith("/hunt") -> {
                     handleHuntCommand(chatId, text)
                 }
 
-                // 4. Plain text or hashtags (e.g. "cs2", "#юмор", "магическая битва") -> automatically treat as Tag Search!
                 !text.startsWith("/") -> {
                     handleHuntCommand(chatId, text)
                 }
@@ -309,19 +344,84 @@ class TelegramBotWorker(
             val chatId = cb.message?.chat?.id ?: return
             if (!isChatAuthorized(chatId)) return
             val data = cb.data ?: return
+            DiagnosticLogger.log("TELEGRAM:BTN", "Нажата кнопка: '$data'")
             handleInlineButtonCallback(scope, chatId, data)
         }
+    }
+
+    private suspend fun handleCookiesDocumentUpload(chatId: Long, doc: TgDocument) {
+        try {
+            DiagnosticLogger.log("COOKIES", "Загрузка файла ${doc.fileName} из Telegram...")
+            val fileResp: TgGetFileResponse = httpClient.get("${baseUrl()}/getFile") {
+                parameter("file_id", doc.fileId)
+            }.body()
+            val filePath = fileResp.result?.filePath
+            if (filePath.isNullOrBlank()) {
+                sendMessage(chatId, "❌ Не удалось получить путь к файлу в Telegram.")
+                return
+            }
+            val downloadUrl = "https://api.telegram.org/file/bot${configStore.getTelegramBotToken()}/$filePath"
+            val targetCookies = File(context.filesDir, "youtube_cookies.txt")
+            val response = httpClient.get(downloadUrl)
+            targetCookies.outputStream().use { out ->
+                response.bodyAsChannel().copyTo(out)
+            }
+            DiagnosticLogger.log(
+                "COOKIES",
+                "✅ Файл youtube_cookies.txt сохранён (${targetCookies.length()} байт)"
+            )
+            sendMessage(
+                chatId,
+                "✅ Файл cookies сохранён (${targetCookies.length() / 1024} KB)!\nТеперь все запросы yt-dlp к YouTube будут идти с твоими куками без ошибки «Please sign in»."
+            )
+        } catch (e: Exception) {
+            DiagnosticLogger.logError("COOKIES", "Ошибка сохранения cookies.txt", e)
+            sendMessage(chatId, "❌ Ошибка сохранения cookies.txt: ${e.message}")
+        }
+    }
+
+    private suspend fun sendFullDiagnosticLog(chatId: Long) {
+        val ytdlpVer = try {
+            YoutubeDL.getInstance().version(context) ?: "unknown"
+        } catch (_: Exception) {
+            "unknown"
+        }
+        val cookiesFile = configStore.getYoutubeCookiesFile()
+        val cookiesStatus = if (cookiesFile != null) "ВКЛ (${cookiesFile.length() / 1024} KB)" else "НЕТ (можно скинуть .txt в чат)"
+
+        val recentLog = DiagnosticLogger.getRecentLinesText(38)
+        val header = "📜 Журнал действий с запуска узла:\n" +
+            "• Версия yt-dlp: $ytdlpVer\n" +
+            "• YouTube Cookies: $cookiesStatus\n" +
+            "• Фонов в пуле: ${clutterFilter.listVerifiedPoolClips().size} шт.\n" +
+            "────────────────────\n"
+
+        val bodyText = (header + recentLog).takeLast(3950)
+
+        val keyboard = InlineKeyboardMarkup(
+            inlineKeyboard = listOf(
+                listOf(
+                    InlineKeyboardButton("🔄 Обновить лог", "log_refresh:0"),
+                    InlineKeyboardButton("📄 Скачать полный .log файл", "log_file:0")
+                ),
+                listOf(
+                    InlineKeyboardButton("⬆️ Обновить ядро yt-dlp сейчас", "ytdlp_update:0"),
+                    InlineKeyboardButton("🧹 Очистить лог", "log_clear:0")
+                )
+            )
+        )
+
+        sendMessageWithKeyboard(chatId, bodyText, keyboard)
     }
 
     private suspend fun sendWelcomeMenu(chatId: Long) {
         sendMessage(
             chatId = chatId,
             text = "⚡ Пульт Pocket Media Forge готов!\n\n" +
-                "Никаких сложных команд учить не нужно — работай прямо так:\n\n" +
-                "1️⃣ Хочешь смонтировать конкретное видео?\n" +
-                "👉 Просто кинь сюда ссылку (YouTube Shorts / Клип / Пикабу / Reddit).\n\n" +
-                "2️⃣ Хочешь, чтобы я сам нашёл ролики по теме?\n" +
-                "👉 Просто напиши в чат тему или теги (например: cs2, юмор, стендап, магическая битва) или нажми кнопку «🔎 Найти видео по теме» внизу экрана!"
+                "1️⃣ Кинь любую ссылку (YouTube Shorts / Reddit / Пикабу) — сразу скачаю и соберу превью.\n" +
+                "2️⃣ Напиши любое слово или тег (например: cs2, юмор, стендап) — найду ролики по теме.\n" +
+                "3️⃣ Нажми «📜 Полный лог» внизу экрана, чтобы видеть все действия с момента запуска.\n" +
+                "4️⃣ Если YouTube просит вход («Please sign in») — нажми «⬆️ Обновить ядро yt-dlp» в логе или просто скинь в этот чат файл cookies.txt."
         )
     }
 
@@ -329,10 +429,18 @@ class TelegramBotWorker(
         val poolSize = clutterFilter.listVerifiedPoolClips().size
         val subs = topicHunter.listAutopilotSubscriptions()
         val svcState = PipelineForegroundService.statusFlow.value
+        val ytdlpVer = try {
+            YoutubeDL.getInstance().version(context) ?: "unknown"
+        } catch (_: Exception) {
+            "unknown"
+        }
+        val cookiesLoaded = configStore.getYoutubeCookiesFile() != null
 
         val text = "📊 Статус узла (OnePlus Snapdragon):\n\n" +
             "• Ваш Chat ID: $chatId\n" +
             "• Конвейер: $svcState\n" +
+            "• Версия ядра yt-dlp: $ytdlpVer\n" +
+            "• Куки YouTube (cookies.txt): ${if (cookiesLoaded) "✅ Загружены" else "Нет (работа через android_vr/Piped)"}\n" +
             "• Готовых залипалок в пуле (1080x960): $poolSize шт.\n" +
             "• Активных задач на сборке: ${sessions.size}\n" +
             "• Фоновый Автопилот: ${if (isAutopilotEnabled.get()) "🟢 ВКЛ (каждые $autopilotIntervalMinutes мин)" else "⏸ НА ПАУЗЕ"} (тем: ${subs.size})"
@@ -340,7 +448,11 @@ class TelegramBotWorker(
         val keyboard = InlineKeyboardMarkup(
             inlineKeyboard = listOf(
                 listOf(
-                    InlineKeyboardButton("🔄 Докачать залипалки в пул сейчас", "pool_warmup:0")
+                    InlineKeyboardButton("📜 Открыть полный лог действий", "log_refresh:0")
+                ),
+                listOf(
+                    InlineKeyboardButton("🔄 Докачать залипалки в пул", "pool_warmup:0"),
+                    InlineKeyboardButton("⬆️ Обновить ядро yt-dlp", "ytdlp_update:0")
                 )
             )
         )
@@ -472,7 +584,7 @@ class TelegramBotWorker(
                 if (candidates.isEmpty()) {
                     sendMessage(
                         chatId,
-                        "⚠️ По запросу «${state.queryTags}» не удалось получить список видео. Проверь интернет/VPN на телефоне или попробуй другое слово."
+                        "⚠️ По запросу «${state.queryTags}» не удалось получить список видео. Нажми «📜 Полный лог», чтобы увидеть точную причину."
                     )
                     return@enqueueHardwareTask
                 }
@@ -501,14 +613,16 @@ class TelegramBotWorker(
                         )
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed candidate ${cand.url}", e)
+                        DiagnosticLogger.logError("HUNT:BATCH", "Ошибка сборки кандидата ${cand.url}", e)
                         sendMessage(
                             chatId,
-                            "⚠️ Пропущен ролик «${cand.title.take(40)}»: ${e.message?.take(120)}"
+                            "⚠️ Пропущен ролик «${cand.title.take(40)}»:\n${e.message?.take(220)}"
                         )
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Hunt batch error", e)
+                DiagnosticLogger.logError("HUNT:BATCH", "Критическая ошибка пакетного поиска", e)
                 sendMessage(chatId, "❌ Ошибка поиска: ${e.message}")
             }
         }
@@ -582,7 +696,7 @@ class TelegramBotWorker(
         if (!isAutopilotEnabled.compareAndSet(false, true)) return
 
         autopilotJob = scope.launch(Dispatchers.IO) {
-            Log.i(TAG, "Autopilot background tag hunter started")
+            DiagnosticLogger.log("AUTOPILOT", "Фоновый цикл Автопилота запущен")
             while (isActive && isAutopilotEnabled.get()) {
                 runSingleAutopilotSweep(autopilotChatId)
                 delay(autopilotIntervalMinutes * 60_000L)
@@ -614,7 +728,7 @@ class TelegramBotWorker(
                         )
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Autopilot sweep failed for ${sub.queryTags}", e)
+                    DiagnosticLogger.logError("AUTOPILOT", "Ошибка обхода темы ${sub.queryTags}", e)
                 }
             }
         }
@@ -647,10 +761,11 @@ class TelegramBotWorker(
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Job #$jobId failed", e)
+                DiagnosticLogger.logError("JOB:$jobId", "Задача завершилась с ошибкой", e)
                 sendMessage(
                     chatId = chatId,
-                    text = "❌ Задача #$jobId завершилась с ошибкой:\n${e.message ?: "Неизвестная ошибка при обработке видео"}\n\n" +
-                        "💡 Если это YouTube, убедись, что на телефоне включён VPN."
+                    text = "❌ Задача #$jobId завершилась с ошибкой:\n${e.message ?: "Неизвестная ошибка"}\n\n" +
+                        "📜 Нажми «📜 Полный лог» внизу для просмотра всех деталей."
                 )
             }
         }
@@ -669,9 +784,8 @@ class TelegramBotWorker(
         sendMessage(chatId, "📥 [#$jobId • Шаг 1/4] Скачиваю исходное видео...")
         val bundle = clutterFilter.downloadMediaWithMetadata(url, maxDurationSec = 75)
         val durationSec = hardwareEngine.probeDurationSeconds(bundle.videoFile)
+        DiagnosticLogger.log("JOB:$jobId", "Видео скачано (${bundle.videoFile.length() / 1024} KB, ${durationSec}с)")
 
-        // Smart auto-layout: if input is already vertical 9:16 (like a YouTube Short), default to FULLSCREEN_EDIT
-        // so it isn't squashed; if input is horizontal 16:9, default to SPLIT_VSTACK (50/50 split)!
         val isVertical = faceHelper.isVerticalSource(bundle.videoFile)
         val resolvedConfig = initialConfig ?: buildDefaultConfigWithSavedAdAssets(isVerticalInput = isVertical)
 
@@ -685,6 +799,7 @@ class TelegramBotWorker(
             videoFile = bundle.videoFile,
             enableSmartFaceCrop = resolvedConfig.enableSmartFaceCrop
         )
+        DiagnosticLogger.log("JOB:$jobId", "План кадрирования: ${framingPlan.summary}")
 
         sendMessage(chatId, "💬 [#$jobId • Шаг 3/4] Готовлю субтитры...")
         val (subResult, words) = subtitleTransformer.prepareAssSubtitles(
@@ -693,6 +808,7 @@ class TelegramBotWorker(
             config = resolvedConfig.subtitleLayer,
             framingPlan = framingPlan
         )
+        DiagnosticLogger.log("JOB:$jobId", "Субтитры готовы (слов=${words.size})")
 
         val session = InteractiveJobSession(
             jobId = jobId,
@@ -713,6 +829,7 @@ class TelegramBotWorker(
 
         sendMessage(chatId, "⚡ [#$jobId • Шаг 4/4] Рендерю 5-сек превью и отправляю в чат...")
         renderAndSendPreviewWithControls(session)
+        DiagnosticLogger.log("JOB:$jobId", "✅ 5-сек превью успешно отправлено в Telegram!")
     }
 
     private suspend fun renderAndSendPreviewWithControls(session: InteractiveJobSession) {
@@ -828,15 +945,52 @@ class TelegramBotWorker(
         val action = parts[0]
         val targetId = parts[1]
 
-        if (action == "pool_warmup") {
-            clutterFilter.triggerBackgroundPoolWarmupIfNeeded()
-            sendMessage(chatId, "🔄 Запущена фоновая докачка и проверка залипалок (1080x960) в локальный пул!")
-            return
-        }
-
-        if (action == "quick_hunt") {
-            handleHuntCommand(chatId, targetId)
-            return
+        when (action) {
+            "log_refresh" -> {
+                sendFullDiagnosticLog(chatId)
+                return
+            }
+            "log_file" -> {
+                val logFile = DiagnosticLogger.getFullLogFile(context)
+                sendUncompressedDocument(chatId, logFile, "📜 Полный лог с момента запуска (diagnostic_boot.log)")
+                return
+            }
+            "log_clear" -> {
+                DiagnosticLogger.clear(context)
+                sendFullDiagnosticLog(chatId)
+                return
+            }
+            "ytdlp_update" -> {
+                sendMessage(chatId, "⬆️ Запускаю обновление бинарника yt-dlp до последней версии...")
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        DiagnosticLogger.log("YTDLP-UPDATE", "Ручной запуск обновления yt-dlp из Telegram...")
+                        val status = YoutubeDL.getInstance().updateYoutubeDL(
+                            context,
+                            YoutubeDL.UpdateChannel._NIGHTLY
+                        )
+                        val ver = YoutubeDL.getInstance().version(context) ?: "unknown"
+                        DiagnosticLogger.log("YTDLP-UPDATE", "Результат обновления: $status | Текущая версия: $ver")
+                        sendMessage(chatId, "✅ Ядро yt-dlp обновлено!\n• Статус: $status\n• Версия: $ver")
+                    } catch (e: Exception) {
+                        DiagnosticLogger.logError("YTDLP-UPDATE", "Ошибка ручного обновления yt-dlp", e)
+                        sendMessage(chatId, "❌ Ошибка обновления yt-dlp: ${e.message}")
+                    }
+                }
+                return
+            }
+            "pool_warmup" -> {
+                clutterFilter.triggerBackgroundPoolWarmupIfNeeded()
+                sendMessage(
+                    chatId,
+                    "🔄 Запущена фоновая докачка залипалок! Нажми «📜 Полный лог» через 10–15 секунд, чтобы видеть ход скачивания каждого файла."
+                )
+                return
+            }
+            "quick_hunt" -> {
+                handleHuntCommand(chatId, targetId)
+                return
+            }
         }
 
         if (action.startsWith("hunt_")) {
@@ -934,6 +1088,7 @@ class TelegramBotWorker(
                         renderFinalAndDeliver(session)
                     } catch (e: Exception) {
                         Log.e(TAG, "Final render failed for #$targetId", e)
+                        DiagnosticLogger.logError("RENDER:$targetId", "Ошибка финального рендера", e)
                         sendMessage(chatId, "❌ Ошибка финального рендера #$targetId: ${e.message}")
                     }
                 }
@@ -949,6 +1104,7 @@ class TelegramBotWorker(
                         exportAndDeliverRawSourcePack(session)
                     } catch (e: Exception) {
                         Log.e(TAG, "Raw pack failed for #$targetId", e)
+                        DiagnosticLogger.logError("RAW:$targetId", "Ошибка выгрузки исходников", e)
                         sendMessage(chatId, "❌ Ошибка выгрузки исходников #$targetId: ${e.message}")
                     }
                 }
@@ -1076,6 +1232,7 @@ class TelegramBotWorker(
             try {
                 renderAndSendPreviewWithControls(session)
             } catch (e: Exception) {
+                DiagnosticLogger.logError("PREVIEW:${session.jobId}", "Ошибка пересборки превью", e)
                 sendMessage(session.chatId, "❌ Ошибка пересборки превью: ${e.message}")
             }
         }
@@ -1087,6 +1244,7 @@ class TelegramBotWorker(
                 regenerateAssForSession(session)
                 renderAndSendPreviewWithControls(session)
             } catch (e: Exception) {
+                DiagnosticLogger.logError("SUBS:${session.jobId}", "Ошибка обновления субтитров", e)
                 sendMessage(session.chatId, "❌ Ошибка обновления субтитров: ${e.message}")
             }
         }
@@ -1196,7 +1354,6 @@ class TelegramBotWorker(
 
     private fun buildDefaultConfigWithSavedAdAssets(isVerticalInput: Boolean = false): ModularRenderConfig {
         val base = if (isVerticalInput) {
-            // If source is already a 9:16 vertical Short, keep it full-screen by default (user can switch to Split 50/50 in 1 tap)
             ModularRenderConfig.presetFullscreenEdit().copy(
                 subtitleLayer = forge.media.pocket.subtitles.SubtitleLayerConfig(enabled = true)
             )
@@ -1363,6 +1520,7 @@ class TelegramBotWorker(
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to upload preview video to Telegram", e)
+            DiagnosticLogger.logError("TELEGRAM:UPLOAD", "Не удалось отправить видео", e)
             sendMessage(chatId, "❌ Не удалось отправить видео-превью в Telegram: ${e.message}")
         }
     }
@@ -1398,6 +1556,7 @@ class TelegramBotWorker(
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to upload uncompressed document to Telegram", e)
+            DiagnosticLogger.logError("TELEGRAM:DOC", "Не удалось отправить документ", e)
             sendMessage(chatId, "❌ Не удалось отправить файл ${file.name}: ${e.message}")
         }
     }

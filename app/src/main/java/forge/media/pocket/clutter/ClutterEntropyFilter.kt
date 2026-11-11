@@ -6,14 +6,19 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
+import forge.media.pocket.config.DiagnosticLogger
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.client.request.header
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.HttpHeaders
+import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
+import io.ktor.utils.io.jvm.javaio.copyTo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -49,15 +54,16 @@ class ClutterEntropyFilter(private val context: Context) {
 
     companion object {
         private const val TAG = "ClutterEntropyFilter"
-        private const val SCENE_CUT_THRESHOLD = 0.42
+        private const val SCENE_CUT_THRESHOLD = 0.45
         private const val FREEZE_NOISE_TOLERANCE = 0.003
-        private const val FREEZE_MIN_DURATION_SEC = 2.5
+        private const val FREEZE_MIN_DURATION_SEC = 3.0
         private const val MAX_POOL_CLIPS = 16
         private const val SEGMENT_DURATION_SEC = 60
     }
 
     private val poolDir = File(context.filesDir, "clutter_pool").apply { mkdirs() }
     private val stagingDir = File(context.cacheDir, "work_staging").apply { mkdirs() }
+    private val cookiesFile = File(context.filesDir, "youtube_cookies.txt")
     private val poolMutex = Mutex()
     private val backgroundWarmupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val isWarmingUpPool = AtomicBoolean(false)
@@ -68,6 +74,11 @@ class ClutterEntropyFilter(private val context: Context) {
     }
 
     private val httpClient = HttpClient(OkHttp) {
+        install(HttpTimeout) {
+            requestTimeoutMillis = 60_000L
+            connectTimeoutMillis = 15_000L
+            socketTimeoutMillis = 60_000L
+        }
         install(ContentNegotiation) {
             json(jsonFormat)
         }
@@ -107,6 +118,35 @@ class ClutterEntropyFilter(private val context: Context) {
         val duration: Int = 0
     )
 
+    @Serializable
+    private data class PipedStreamsResponse(
+        val title: String? = null,
+        val uploader: String? = null,
+        val videoStreams: List<PipedVideoStream> = emptyList()
+    )
+
+    @Serializable
+    private data class PipedVideoStream(
+        val url: String? = null,
+        val format: String? = null,
+        val quality: String? = null,
+        val videoOnly: Boolean = true
+    )
+
+    @Serializable
+    private data class InvidiousVideoResponse(
+        val title: String? = null,
+        val author: String? = null,
+        val formatStreams: List<InvidiousFormatStream> = emptyList()
+    )
+
+    @Serializable
+    private data class InvidiousFormatStream(
+        val url: String? = null,
+        val container: String? = null,
+        val qualityLabel: String? = null
+    )
+
     suspend fun auditClipEntropy(candidateFile: File): EntropyAuditResult =
         suspendCancellableCoroutine { cont ->
             val filterChain = buildString {
@@ -127,16 +167,21 @@ class ClutterEntropyFilter(private val context: Context) {
                 val hardCutCount = Regex("""\[Parsed_showinfo.*pts_time:""").findAll(logs).count()
                 val freezeCount = Regex("""lavfi\.freezedetect\.freeze_start""").findAll(logs).count()
 
-                val isClean = (hardCutCount <= 2) && (freezeCount == 0)
+                val isClean = (hardCutCount <= 4) && (freezeCount == 0)
                 val reason = when {
-                    hardCutCount > 2 && freezeCount > 0 ->
-                        "Rejected: $hardCutCount hard scene cuts and $freezeCount static freezes"
-                    hardCutCount > 2 ->
-                        "Rejected: $hardCutCount hard scene cuts"
+                    hardCutCount > 4 && freezeCount > 0 ->
+                        "Отклонено: $hardCutCount резких склеек и $freezeCount зависаний"
+                    hardCutCount > 4 ->
+                        "Отклонено: $hardCutCount резких склеек (>4)"
                     freezeCount > 0 ->
-                        "Rejected: $freezeCount static/frozen screens"
+                        "Отклонено: $freezeCount статичных пауз"
                     else -> null
                 }
+
+                DiagnosticLogger.log(
+                    "ENTROPY",
+                    "Файл ${candidateFile.name}: склеек=$hardCutCount, зависаний=$freezeCount -> годен=$isClean"
+                )
 
                 if (cont.isActive) {
                     cont.resume(
@@ -155,17 +200,27 @@ class ClutterEntropyFilter(private val context: Context) {
         sourceUrl: String,
         maxDurationSec: Int = 75
     ): IngestedMediaBundle = withContext(Dispatchers.IO) {
+        DiagnosticLogger.log("DOWNLOAD", "Начало загрузки медиа и метаданных: $sourceUrl")
         var origTitle = ""
         var origUploader = ""
         var origTags = emptyList<String>()
 
         try {
-            val info = YoutubeDL.getInstance().getInfo(sourceUrl)
+            val req = YoutubeDLRequest(sourceUrl).apply {
+                addOption("--extractor-args", "youtube:player_client=android_vr,ios,tv")
+                addOption("--no-playlist")
+                addOption("--no-check-certificates")
+                if (cookiesFile.exists() && cookiesFile.length() > 10L) {
+                    addOption("--cookies", cookiesFile.absolutePath)
+                }
+            }
+            val info = YoutubeDL.getInstance().getInfo(req)
             origTitle = info.title ?: ""
             origUploader = info.uploader ?: ""
             origTags = info.tags ?: emptyList()
+            DiagnosticLogger.log("METADATA", "Получены метаданные: title='$origTitle', author='$origUploader'")
         } catch (e: Exception) {
-            Log.w(TAG, "Metadata pre-fetch warning for $sourceUrl: ${e.message}")
+            DiagnosticLogger.log("METADATA", "Предупреждение getInfo (не фатально): ${e.message?.take(140)}")
         }
 
         val file = downloadMediaFromUrl(sourceUrl, maxDurationSec)
@@ -184,38 +239,180 @@ class ClutterEntropyFilter(private val context: Context) {
         val rawBase = File(stagingDir, "ingest_${UUID.randomUUID()}")
         val finalMp4 = File(stagingDir, "${rawBase.name}.mp4")
 
-        // Prefer single-file MP4 first so yt-dlp doesn't fail spawning external muxers on Android
-        val request = YoutubeDLRequest(sourceUrl).apply {
-            addOption(
-                "-f",
-                "best[height<=1080][ext=mp4]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best"
-            )
-            addOption("--merge-output-format", "mp4")
-            addOption("--no-playlist")
-            addOption("--no-check-certificates")
-            addOption("--geo-bypass")
-            addOption("-o", finalMp4.absolutePath)
+        // Strategy 0: Direct HTTP download if URL is already a direct .mp4 stream (e.g. Reddit v.redd.it DASH_720.mp4)
+        if (sourceUrl.contains(".mp4", ignoreCase = true) || sourceUrl.contains("v.redd.it", ignoreCase = true)) {
+            DiagnosticLogger.log("DOWNLOAD", "Стратегия 0 (Прямой HTTP поток): $sourceUrl")
+            if (tryDirectHttpDownload(sourceUrl, finalMp4)) {
+                DiagnosticLogger.log("DOWNLOAD", "✅ Успешно скачано по прямому HTTP (${finalMp4.length() / 1024} KB)")
+                return@withContext trimIfNeeded(finalMp4, rawBase.name, maxDurationSec)
+            }
         }
 
-        YoutubeDL.getInstance().execute(request)
+        val errors = mutableListOf<String>()
 
-        // Locate downloaded file even if yt-dlp appended another extension
-        val downloaded = when {
-            finalMp4.exists() && finalMp4.length() > 0L -> finalMp4
-            else -> stagingDir.listFiles { f -> f.name.startsWith(rawBase.name) && f.length() > 0L }
-                ?.firstOrNull()
-        } ?: throw IllegalStateException("Не удалось скачать видео по ссылке: $sourceUrl")
+        // Strategy 1: yt-dlp with android_vr,ios,tv (Bypasses YouTube HTTP 400 Precondition check & Please sign in!)
+        val clientProfiles = listOf(
+            "youtube:player_client=android_vr,ios,tv",
+            "youtube:player_client=tv_embedded,mweb,web_creator",
+            "youtube:player_client=ios,web"
+        )
 
-        // Trim locally via FFmpegKit if needed
-        val trimmedFile = File(stagingDir, "${rawBase.name}_trimmed.mp4")
+        for ((idx, profile) in clientProfiles.withIndex()) {
+            try {
+                DiagnosticLogger.log("DOWNLOAD", "Попытка yt-dlp #${idx + 1} ($profile) для $sourceUrl")
+                val request = YoutubeDLRequest(sourceUrl).apply {
+                    addOption(
+                        "-f",
+                        "best[height<=1080][ext=mp4]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best"
+                    )
+                    addOption("--extractor-args", profile)
+                    addOption("--merge-output-format", "mp4")
+                    addOption("--no-playlist")
+                    addOption("--no-check-certificates")
+                    addOption("--geo-bypass")
+                    if (cookiesFile.exists() && cookiesFile.length() > 10L) {
+                        addOption("--cookies", cookiesFile.absolutePath)
+                        DiagnosticLogger.log("DOWNLOAD", "Используется файл youtube_cookies.txt")
+                    }
+                    addOption("-o", finalMp4.absolutePath)
+                }
+
+                val res = YoutubeDL.getInstance().execute(request)
+                DiagnosticLogger.log("DOWNLOAD", "yt-dlp #${idx + 1} завершился (out=${res.out.take(120)})")
+
+                val located = locateDownloadedFile(finalMp4, rawBase.name)
+                if (located != null) {
+                    DiagnosticLogger.log(
+                        "DOWNLOAD",
+                        "✅ Успешно скачано через yt-dlp ($profile): ${located.length() / 1024} KB"
+                    )
+                    return@withContext trimIfNeeded(located, rawBase.name, maxDurationSec)
+                }
+            } catch (e: Exception) {
+                val msg = e.message?.take(220) ?: "unknown error"
+                errors.add("Попытка #${idx + 1} ($profile): $msg")
+                DiagnosticLogger.logError("DOWNLOAD", "Сбой попытки #${idx + 1} ($profile)", e)
+            }
+        }
+
+        // Strategy 2: If YouTube still blocked yt-dlp, try public Piped / Invidious API fallback by video ID
+        val ytVideoId = extractYoutubeVideoId(sourceUrl)
+        if (ytVideoId != null) {
+            DiagnosticLogger.log("DOWNLOAD", "Пробую обходной API (Piped/Invidious) для YouTube ID=$ytVideoId...")
+            if (tryDownloadYoutubeViaFallbackApis(ytVideoId, finalMp4)) {
+                DiagnosticLogger.log(
+                    "DOWNLOAD",
+                    "✅ Успешно скачано через резервный Piped/Invidious API (${finalMp4.length() / 1024} KB)"
+                )
+                return@withContext trimIfNeeded(finalMp4, rawBase.name, maxDurationSec)
+            } else {
+                errors.add("Резервные зеркала Piped/Invidious не отдали поток для $ytVideoId")
+            }
+        }
+
+        val combinedError = errors.joinToString("\n")
+        throw IllegalStateException(
+            "Не удалось скачать видео.\n$combinedError\n\n" +
+                "💡 Совет: нажми «📜 Полный лог» -> «🔄 Обновить yt-dlp» или скинь в этот чат файл cookies.txt от YouTube."
+        )
+    }
+
+    private fun locateDownloadedFile(expectedMp4: File, prefix: String): File? {
+        if (expectedMp4.exists() && expectedMp4.length() > 10_000L) return expectedMp4
+        return stagingDir.listFiles { f -> f.name.startsWith(prefix) && f.length() > 10_000L }
+            ?.firstOrNull()
+    }
+
+    private suspend fun trimIfNeeded(downloaded: File, baseName: String, maxDurationSec: Int): File {
+        val trimmedFile = File(stagingDir, "${baseName}_trimmed.mp4")
         val trimSuccess = trimVideoLocally(downloaded, trimmedFile, maxDurationSec)
         if (trimSuccess && trimmedFile.exists() && trimmedFile.length() > 10_000L) {
             downloaded.delete()
-            return@withContext trimmedFile
+            return trimmedFile
+        }
+        return downloaded
+    }
+
+    private suspend fun tryDirectHttpDownload(url: String, targetFile: File): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = httpClient.get(url) {
+                    header(
+                        HttpHeaders.UserAgent,
+                        "Mozilla/5.0 (Linux; Android 14; OnePlus) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36"
+                    )
+                }
+                if (!response.status.isSuccess()) return@withContext false
+                targetFile.outputStream().use { out ->
+                    response.bodyAsChannel().copyTo(out)
+                }
+                targetFile.exists() && targetFile.length() > 20_000L
+            } catch (e: Exception) {
+                DiagnosticLogger.log("DOWNLOAD", "Прямой HTTP не удался для $url: ${e.message}")
+                false
+            }
         }
 
-        downloaded
+    private fun extractYoutubeVideoId(url: String): String? {
+        val patterns = listOf(
+            Regex("""youtube\.com/shorts/([a-zA-Z0-9_-]{11})"""),
+            Regex("""[?&]v=([a-zA-Z0-9_-]{11})"""),
+            Regex("""youtu\.be/([a-zA-Z0-9_-]{11})""")
+        )
+        for (p in patterns) {
+            val m = p.find(url)
+            if (m != null) return m.groupValues[1]
+        }
+        return null
     }
+
+    private suspend fun tryDownloadYoutubeViaFallbackApis(videoId: String, targetFile: File): Boolean =
+        withContext(Dispatchers.IO) {
+            val pipedInstances = listOf(
+                "https://pipedapi.kavin.rocks",
+                "https://pipedapi.tokhmi.xyz",
+                "https://api.piped.private.coffee"
+            )
+            for (instance in pipedInstances) {
+                try {
+                    DiagnosticLogger.log("PIPED-API", "Запрос потока с $instance/streams/$videoId")
+                    val resp: PipedStreamsResponse = httpClient.get("$instance/streams/$videoId") {
+                        header(HttpHeaders.UserAgent, "PocketMediaForge/1.2")
+                    }.body()
+
+                    val streamUrl = resp.videoStreams
+                        .firstOrNull { !it.videoOnly && (it.format?.contains("MPEG_4") == true || it.url != null) }
+                        ?.url
+                        ?: resp.videoStreams.firstOrNull { it.url != null }?.url
+
+                    if (!streamUrl.isNullOrBlank() && tryDirectHttpDownload(streamUrl, targetFile)) {
+                        return@withContext true
+                    }
+                } catch (e: Exception) {
+                    DiagnosticLogger.log("PIPED-API", "Зеркало $instance недоступно: ${e.message?.take(80)}")
+                }
+            }
+
+            val invidiousInstances = listOf(
+                "https://inv.tux.pizza",
+                "https://invidious.nerdvpn.de",
+                "https://invidious.privacyredirect.com"
+            )
+            for (inv in invidiousInstances) {
+                try {
+                    DiagnosticLogger.log("INVIDIOUS-API", "Запрос потока с $inv/api/v1/videos/$videoId")
+                    val resp: InvidiousVideoResponse = httpClient.get("$inv/api/v1/videos/$videoId").body()
+                    val streamUrl = resp.formatStreams.firstOrNull { !it.url.isNullOrBlank() }?.url
+                    if (!streamUrl.isNullOrBlank() && tryDirectHttpDownload(streamUrl, targetFile)) {
+                        return@withContext true
+                    }
+                } catch (e: Exception) {
+                    DiagnosticLogger.log("INVIDIOUS-API", "Зеркало $inv недоступно: ${e.message?.take(80)}")
+                }
+            }
+
+            false
+        }
 
     private suspend fun trimVideoLocally(
         inputFile: File,
@@ -236,46 +433,65 @@ class ClutterEntropyFilter(private val context: Context) {
 
     suspend fun fetchRedditOddlySatisfyingUrls(limit: Int = 10): List<String> =
         withContext(Dispatchers.IO) {
-            try {
-                val response: RedditListingResponse = httpClient.get(
-                    "https://www.reddit.com/r/oddlysatisfying/hot.json?limit=$limit"
-                ) {
-                    header(HttpHeaders.UserAgent, "android:forge.media.pocket:v1.2.0 (by /u/pocketforge)")
-                }.body()
+            val subreddits = listOf("oddlysatisfying", "satisfying", "simulated")
+            val urls = mutableListOf<String>()
+            for (sub in subreddits) {
+                try {
+                    DiagnosticLogger.log("POOL-WARMUP", "Запрос ленты Reddit r/$sub/hot.json...")
+                    val response: RedditListingResponse = httpClient.get(
+                        "https://www.reddit.com/r/$sub/hot.json?limit=$limit"
+                    ) {
+                        header(
+                            HttpHeaders.UserAgent,
+                            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36"
+                        )
+                    }.body()
 
-                response.data?.children
-                    ?.mapNotNull { it.data }
-                    ?.filter { it.isVideo && !it.over18 }
-                    ?.mapNotNull { it.media?.redditVideo?.fallbackUrl }
-                    ?: emptyList()
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to fetch Reddit r/oddlysatisfying JSON feed", e)
-                emptyList()
+                    val found = response.data?.children
+                        ?.mapNotNull { it.data }
+                        ?.filter { it.isVideo && !it.over18 }
+                        ?.mapNotNull { it.media?.redditVideo?.fallbackUrl }
+                        ?: emptyList()
+
+                    DiagnosticLogger.log("POOL-WARMUP", "Из r/$sub получено ${found.size} прямых MP4 ссылок")
+                    urls.addAll(found)
+                    if (urls.size >= limit) break
+                } catch (e: Exception) {
+                    DiagnosticLogger.logError("POOL-WARMUP", "Не удалось получить r/$sub", e)
+                }
             }
+            urls.distinct()
         }
 
     suspend fun ingestAndVerifyClutterCandidate(sourceUrl: String): File? =
         withContext(Dispatchers.IO) {
             var rawFile: File? = null
             try {
+                DiagnosticLogger.log("POOL-WARMUP", "Скачиваю кандидата в пул фонов: $sourceUrl")
                 rawFile = downloadMediaFromUrl(sourceUrl, maxDurationSec = SEGMENT_DURATION_SEC)
                 val audit = auditClipEntropy(rawFile)
 
                 if (!audit.isMonotonousAndValid) {
+                    DiagnosticLogger.log("POOL-WARMUP", "Кандидат отклонён фильтром 3.3A: ${audit.rejectionReason}")
                     return@withContext null
                 }
 
                 val normalizedFile = File(poolDir, "clutter_${System.currentTimeMillis()}.mp4")
                 val standardized = standardizeClipTo1080x960(rawFile, normalizedFile)
                 if (!standardized) {
+                    DiagnosticLogger.log("POOL-WARMUP", "Ошибка нормализации кандидата в 1080x960")
                     normalizedFile.delete()
                     return@withContext null
                 }
 
+                DiagnosticLogger.log(
+                    "POOL-WARMUP",
+                    "✅ Кандидат добавлен в пул фонов: ${normalizedFile.name} (${normalizedFile.length() / 1024} KB)"
+                )
                 enforceCircularBufferQuota()
                 normalizedFile
             } catch (e: Exception) {
-                Log.e(TAG, "Failed clutter ingestion for $sourceUrl", e)
+                DiagnosticLogger.logError("POOL-WARMUP", "Ошибка загрузки кандидата $sourceUrl", e)
                 null
             } finally {
                 rawFile?.delete()
@@ -283,45 +499,74 @@ class ClutterEntropyFilter(private val context: Context) {
         }
 
     fun triggerBackgroundPoolWarmupIfNeeded() {
-        if (listVerifiedPoolClips().size >= 3) return
-        if (!isWarmingUpPool.compareAndSet(false, true)) return
+        val currentCount = listVerifiedPoolClips().size
+        if (currentCount >= 3) {
+            DiagnosticLogger.log("POOL-WARMUP", "В пуле уже $currentCount проверенных фонов (>=3), докачка не требуется.")
+            return
+        }
+        if (!isWarmingUpPool.compareAndSet(false, true)) {
+            DiagnosticLogger.log("POOL-WARMUP", "Фоновая докачка пула уже выполняется...")
+            return
+        }
 
         backgroundWarmupScope.launch {
             try {
-                // 1. Try YouTube satisfying Shorts first (works without Reddit blocks)
-                val ytQueries = listOf(
-                    "ytsearch2:oddly satisfying kinetic sand #shorts",
-                    "ytsearch2:soap cutting ASMR no talking #shorts"
-                )
-                for (q in ytQueries) {
-                    try {
-                        val req = YoutubeDLRequest(q).apply {
-                            addOption("--flat-playlist")
-                            addOption("--get-id")
-                            addOption("--skip-download")
-                        }
-                        val ids = YoutubeDL.getInstance().execute(req).out.lines()
-                            .map { it.trim() }
-                            .filter { it.isNotEmpty() }
-                        for (id in ids) {
-                            ingestAndVerifyClutterCandidate("https://www.youtube.com/watch?v=$id")
-                            if (listVerifiedPoolClips().size >= 3) break
-                        }
-                    } catch (_: Exception) {
-                    }
+                DiagnosticLogger.log("POOL-WARMUP", "▶️ Старт фоновой докачки залипалок (сейчас в пуле: $currentCount шт.)")
+
+                // 1. Try direct MP4 streams from Reddit r/oddlysatisfying, r/satisfying, r/simulated (downloaded via OkHttp!)
+                val redditUrls = fetchRedditOddlySatisfyingUrls(limit = 8)
+                for (url in redditUrls) {
+                    ingestAndVerifyClutterCandidate(url)
                     if (listVerifiedPoolClips().size >= 3) break
                 }
 
-                // 2. Also try Reddit oddlysatisfying if still < 3
+                // 2. If still < 3, try YouTube satisfying Shorts with android_vr extractor
                 if (listVerifiedPoolClips().size < 3) {
-                    val redditUrls = fetchRedditOddlySatisfyingUrls(limit = 6)
-                    for (url in redditUrls) {
-                        ingestAndVerifyClutterCandidate(url)
+                    val ytQueries = listOf(
+                        "ytsearch3:oddly satisfying kinetic sand #shorts",
+                        "ytsearch3:soap cutting ASMR no talking #shorts"
+                    )
+                    for (q in ytQueries) {
+                        try {
+                            DiagnosticLogger.log("POOL-WARMUP", "Ищу залипалки на YouTube: $q")
+                            val req = YoutubeDLRequest(q).apply {
+                                addOption("--flat-playlist")
+                                addOption("--get-id")
+                                addOption("--skip-download")
+                                addOption("--extractor-args", "youtube:player_client=android_vr,ios,tv")
+                            }
+                            val ids = YoutubeDL.getInstance().execute(req).out.lines()
+                                .map { it.trim() }
+                                .filter { it.length == 11 }
+                            for (id in ids) {
+                                ingestAndVerifyClutterCandidate("https://www.youtube.com/watch?v=$id")
+                                if (listVerifiedPoolClips().size >= 3) break
+                            }
+                        } catch (e: Exception) {
+                            DiagnosticLogger.logError("POOL-WARMUP", "Сбой поиска залипалок YouTube ($q)", e)
+                        }
                         if (listVerifiedPoolClips().size >= 3) break
                     }
                 }
+
+                // 3. Guaranteed fallback: if both Reddit and YouTube are blocked by ISP/VPN, generate 2 synthetic motion clips into the pool!
+                if (listVerifiedPoolClips().isEmpty()) {
+                    DiagnosticLogger.log(
+                        "POOL-WARMUP",
+                        "⚠️ Внешние площадки недоступны (блок сети/VPN). Генерирую резервный локальный фон 1080x960 в пул..."
+                    )
+                    val synthFile = File(poolDir, "clutter_synth_${System.currentTimeMillis()}.mp4")
+                    if (createProceduralAnimatedClutter(20.0, synthFile)) {
+                        DiagnosticLogger.log("POOL-WARMUP", "✅ Создан резервный локальный фон: ${synthFile.name}")
+                    }
+                }
+
+                DiagnosticLogger.log(
+                    "POOL-WARMUP",
+                    "🏁 Завершена докачка пула. Сейчас готовых фонов: ${listVerifiedPoolClips().size} шт."
+                )
             } catch (e: Exception) {
-                Log.w(TAG, "Background clutter warmup warning: ${e.message}")
+                DiagnosticLogger.logError("POOL-WARMUP", "Общая ошибка фоновой докачки", e)
             } finally {
                 isWarmingUpPool.set(false)
             }
@@ -334,8 +579,8 @@ class ClutterEntropyFilter(private val context: Context) {
     ): File = withContext(Dispatchers.IO) {
         val verifiedPool = listVerifiedPoolClips()
 
-        // Never block the user's job for 5 minutes or crash if the pool is still warming up!
         if (verifiedPool.isEmpty()) {
+            DiagnosticLogger.log("CLUTTER", "Пул фонов пуст — создаю быстрый размытый motion-фон из основного видео...")
             triggerBackgroundPoolWarmupIfNeeded()
             val fallbackOut = File(stagingDir, "fallback_clutter_${System.currentTimeMillis()}.mp4")
             if (fallbackPrimaryVideo != null && fallbackPrimaryVideo.exists()) {
@@ -383,7 +628,7 @@ class ClutterEntropyFilter(private val context: Context) {
             append("fps=30,")
             append("scale=1080:960:force_original_aspect_ratio=increase:flags=fast_bilinear,")
             append("crop=1080:960:(iw-1080)/2:(ih-960)/2,")
-            append("boxblur=16:2,eq=saturation=1.35:contrast=1.1,setsar=1,format=nv12")
+            append("boxblur=16:2,eq=saturation=1.35:contrast=1.1,setsar=1,format=yuv420p")
         }
         val cmd = buildString {
             append("-hide_banner -loglevel error -nostdin -y ")
@@ -405,7 +650,7 @@ class ClutterEntropyFilter(private val context: Context) {
         val dur = targetDurationSec.coerceIn(5.0, 75.0)
         val cmd = buildString {
             append("-hide_banner -loglevel error -nostdin -y ")
-            append("-f lavfi -i \"color=c=#12131A:s=1080x960:r=30:d=$dur\" ")
+            append("-f lavfi -i \"testsrc2=s=1080x960:r=30:d=$dur,boxblur=25:2,eq=brightness=-0.15:saturation=1.4\" ")
             append("-c:v libx264 -preset ultrafast -pix_fmt yuv420p ")
             append("\"${outputFile.absolutePath}\"")
         }
@@ -422,7 +667,7 @@ class ClutterEntropyFilter(private val context: Context) {
             append("fps=30,")
             append("scale=1080:960:force_original_aspect_ratio=increase:flags=lanczos,")
             append("crop=1080:960:(iw-1080)/2:(ih-960)/2,")
-            append("setsar=1,format=nv12")
+            append("setsar=1,format=yuv420p")
         }
 
         val cmd = buildString {
@@ -447,7 +692,7 @@ class ClutterEntropyFilter(private val context: Context) {
     ): Boolean = suspendCancellableCoroutine { cont ->
         val inputsArg = fragments.joinToString(" ") { "-i \"${it.absolutePath}\"" }
         val streamLabels = fragments.indices.joinToString("") { "[$it:v:0]" }
-        val filterComplex = "${streamLabels}concat=n=${fragments.size}:v=1:a=0,format=nv12[vout]"
+        val filterComplex = "${streamLabels}concat=n=${fragments.size}:v=1:a=0,format=yuv420p[vout]"
 
         val cmd = buildString {
             append("-hide_banner -loglevel error -nostdin -y ")

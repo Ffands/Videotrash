@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
+import forge.media.pocket.config.DiagnosticLogger
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
@@ -76,6 +77,7 @@ class TopicHunterEngine(private val context: Context) {
 
     private val seenIdsFile = File(context.filesDir, "seen_video_ids.txt")
     private val subscriptionsFile = File(context.filesDir, "autopilot_subscriptions.json")
+    private val cookiesFile = File(context.filesDir, "youtube_cookies.txt")
     private val stateMutex = Mutex()
 
     private val jsonFormat = Json {
@@ -159,6 +161,11 @@ class TopicHunterEngine(private val context: Context) {
         maxDurationSec: Int = 90
     ): List<DiscoveredMediaCandidate> = withContext(Dispatchers.IO) {
         val cleanQuery = sanitizeQuery(queryTags)
+        DiagnosticLogger.log(
+            "HUNT",
+            "Запуск поиска по тегам: '$cleanQuery' (площадка=${platform.name}, сорт=${sortOrder.name}, период=${period.name})"
+        )
+
         val seenIds = loadSeenIds()
         val rawPool = mutableListOf<DiscoveredMediaCandidate>()
 
@@ -201,8 +208,8 @@ class TopicHunterEngine(private val context: Context) {
             candidate.id.isNotBlank() && !seenIds.contains(candidate.id)
         }
 
-        // If all discovered items were already seen before, allow top results so user never gets stuck with 0 results
         if (unseenCandidates.isEmpty() && deduplicatedPool.isNotEmpty()) {
+            DiagnosticLogger.log("HUNT", "Все найденные ролики уже были в seen_ids — сбрасываю фильтр повторов для этой выдачи")
             unseenCandidates = deduplicatedPool
         }
 
@@ -218,6 +225,7 @@ class TopicHunterEngine(private val context: Context) {
         }
 
         val picked = sortedCandidates.take(limitCount.coerceIn(1, 10))
+        DiagnosticLogger.log("HUNT", "Итого выбрано кандидатов: ${picked.size} из ${deduplicatedPool.size}")
         markCandidatesAsSeen(picked.map { it.id })
         picked
     }
@@ -235,7 +243,6 @@ class TopicHunterEngine(private val context: Context) {
                 else -> "ytsearch25"
             }
 
-            // Append shorts keyword if user didn't specify it so YouTube prioritizes 15-60s clips
             val queryWithShortsHint = if (
                 queryTags.lowercase().contains("short") ||
                 queryTags.lowercase().contains("клип") ||
@@ -247,8 +254,6 @@ class TopicHunterEngine(private val context: Context) {
                 "$queryTags shorts"
             }
 
-            // CRITICAL: Use --flat-playlist --dump-json (and NO --no-playlist / --dateafter)
-            // so yt-dlp parses search results in ~1.5 seconds instead of failing on 25 full page loads
             val request = YoutubeDLRequest("$searchPrefix:$queryWithShortsHint").apply {
                 addOption("--flat-playlist")
                 addOption("--dump-json")
@@ -256,6 +261,10 @@ class TopicHunterEngine(private val context: Context) {
                 addOption("--ignore-errors")
                 addOption("--no-check-certificates")
                 addOption("--geo-bypass")
+                addOption("--extractor-args", "youtube:player_client=android_vr,ios,tv")
+                if (cookiesFile.exists() && cookiesFile.length() > 10L) {
+                    addOption("--cookies", cookiesFile.absolutePath)
+                }
             }
 
             val response = YoutubeDL.getInstance().execute(request)
@@ -273,7 +282,6 @@ class TopicHunterEngine(private val context: Context) {
                         else -> "https://www.youtube.com/watch?v=${item.id}"
                     }
 
-                    // In --flat-playlist mode, Shorts sometimes omit duration (null); default to 30s
                     val dur = item.duration?.toInt() ?: 30
                     if (dur in minDurationSec..maxDurationSec) {
                         results.add(
@@ -292,10 +300,10 @@ class TopicHunterEngine(private val context: Context) {
                 } catch (_: Exception) {
                 }
             }
-            Log.i(TAG, "YouTube search for '$queryWithShortsHint' returned ${results.size} candidates")
+            DiagnosticLogger.log("HUNT:YT", "YouTube выдал ${results.size} роликов по запросу '$queryWithShortsHint'")
             results
         } catch (e: Exception) {
-            Log.w(TAG, "YouTube tag search warning for '$queryTags': ${e.message}")
+            DiagnosticLogger.logError("HUNT:YT", "Ошибка поиска YouTube для '$queryTags'", e)
             emptyList()
         }
     }
@@ -315,8 +323,11 @@ class TopicHunterEngine(private val context: Context) {
             }
 
             val listing: RedditSearchListing = httpClient.get("https://www.reddit.com/search.json") {
-                header(HttpHeaders.UserAgent, "android:forge.media.pocket:v1.2.0 (by /u/pocketforge)")
-                parameter("q", "$queryTags")
+                header(
+                    HttpHeaders.UserAgent,
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36"
+                )
+                parameter("q", queryTags)
                 parameter("sort", redditSort)
                 parameter("t", period.redditParam)
                 parameter("limit", 25)
@@ -324,7 +335,7 @@ class TopicHunterEngine(private val context: Context) {
 
             val sdf = SimpleDateFormat("yyyyMMdd", Locale.US)
 
-            listing.data?.children
+            val found = listing.data?.children
                 ?.mapNotNull { it.data }
                 ?.filter { it.isVideo && !it.over18 }
                 ?.mapNotNull { post ->
@@ -350,8 +361,11 @@ class TopicHunterEngine(private val context: Context) {
                         uploadDateYmd = dateStr
                     )
                 } ?: emptyList()
+
+            DiagnosticLogger.log("HUNT:REDDIT", "Reddit выдал ${found.size} видео по запросу '$queryTags'")
+            found
         } catch (e: Exception) {
-            Log.w(TAG, "Reddit tag search warning for '$queryTags': ${e.message}")
+            DiagnosticLogger.logError("HUNT:REDDIT", "Ошибка поиска Reddit для '$queryTags'", e)
             emptyList()
         }
     }
@@ -405,9 +419,10 @@ class TopicHunterEngine(private val context: Context) {
                 } catch (_: Exception) {
                 }
             }
+            DiagnosticLogger.log("HUNT:PIKABU", "Пикабу выдал ${results.size} видео по тегу '$firstTag'")
             results
         } catch (e: Exception) {
-            Log.w(TAG, "Pikabu tag search warning for '$queryTags': ${e.message}")
+            DiagnosticLogger.logError("HUNT:PIKABU", "Ошибка поиска Пикабу для '$queryTags'", e)
             emptyList()
         }
     }

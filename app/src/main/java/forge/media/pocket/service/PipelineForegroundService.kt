@@ -18,6 +18,7 @@ import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
 import forge.media.pocket.clutter.ClutterEntropyFilter
 import forge.media.pocket.compositor.FFmpegHardwareEngine
+import forge.media.pocket.config.DiagnosticLogger
 import forge.media.pocket.config.NodeConfigStore
 import forge.media.pocket.discovery.TopicHunterEngine
 import forge.media.pocket.subtitles.SubtitleAssTransformer
@@ -91,12 +92,19 @@ class PipelineForegroundService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
+        DiagnosticLogger.init(applicationContext)
+        DiagnosticLogger.log("SERVICE", "onCreate() вызван. Инициализация узла Snapdragon...")
+
         configStore = NodeConfigStore(applicationContext)
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         createNotificationChannel()
 
         powerHelper = PowerOptimizationHelper(applicationContext)
         powerHelper.acquireLocksAndRegisterScreenWatcher()
+        DiagnosticLogger.log(
+            "POWER",
+            "WakeLock и WifiLock захвачены. Игнор батареи=${powerHelper.isIgnoringBatteryOptimizations()}"
+        )
 
         promoteToForeground("Initializing Snapdragon Media Pipeline...")
 
@@ -109,14 +117,17 @@ class PipelineForegroundService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
+        DiagnosticLogger.log("SERVICE", "onStartCommand action=${intent?.action ?: "null"}")
         when (intent?.action) {
             ACTION_STOP_ENGINE -> {
+                DiagnosticLogger.log("SERVICE", "Получена команда остановки узла (ACTION_STOP_ENGINE)")
                 _statusFlow.value = ServiceStatus.Stopped
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
             ACTION_RELOAD_CREDENTIALS -> {
+                DiagnosticLogger.log("SERVICE", "Перезагрузка ключей Telegram и Gemini...")
                 promoteToForeground("Reloading Telegram & Gemini credentials...")
                 lifecycleScope.launch(Dispatchers.IO) {
                     restartTelegramBotController()
@@ -128,10 +139,13 @@ class PipelineForegroundService : LifecycleService() {
     }
 
     fun submitHardwareTask(jobId: String, stageDescription: String, block: suspend () -> Unit) {
+        DiagnosticLogger.log("QUEUE", "Задача #$jobId поставлена в очередь: $stageDescription")
         jobQueue.trySend {
             _statusFlow.value = ServiceStatus.Processing(jobId, stageDescription)
             updateNotification("Job #$jobId: $stageDescription")
+            DiagnosticLogger.log("WORKER", "▶️ Старт выполнения задачи #$jobId: $stageDescription")
             block()
+            DiagnosticLogger.log("WORKER", "✅ Завершено выполнение задачи #$jobId")
         }
     }
 
@@ -140,18 +154,53 @@ class PipelineForegroundService : LifecycleService() {
             _statusFlow.value = ServiceStatus.Initializing
             updateNotification("Bootstrapping native yt-dlp & Aria2c binaries...")
 
+            DiagnosticLogger.log("YTDLP-INIT", "Распаковка бинарников YoutubeDL, FFmpeg, Aria2c...")
             YoutubeDL.getInstance().init(applicationContext)
             FFmpeg.getInstance().init(applicationContext)
             Aria2c.getInstance().init(applicationContext)
+
+            val bundledVer = try {
+                YoutubeDL.getInstance().version(applicationContext) ?: "unknown"
+            } catch (_: Exception) {
+                "unknown"
+            }
+            DiagnosticLogger.log("YTDLP-INIT", "Бинарники готовы. Текущая версия yt-dlp: $bundledVer")
 
             File(filesDir, "clutter_pool").mkdirs()
             File(cacheDir, "work_staging").mkdirs()
 
             isNativeEnvReady = true
+
+            // CRITICAL FIX: Bundled yt-dlp in 0.17.2 is from 2024 and gets HTTP 400 Precondition check failed on YouTube!
+            // Update yt-dlp binary to latest NIGHTLY/STABLE release immediately.
+            updateNotification("Updating yt-dlp binary for YouTube 2026...")
+            DiagnosticLogger.log("YTDLP-UPDATE", "Проверяю обновление бинарника yt-dlp (против HTTP 400 YouTube)...")
+            try {
+                val status = YoutubeDL.getInstance().updateYoutubeDL(
+                    applicationContext,
+                    YoutubeDL.UpdateChannel._NIGHTLY
+                )
+                val newVer = YoutubeDL.getInstance().version(applicationContext) ?: bundledVer
+                DiagnosticLogger.log("YTDLP-UPDATE", "Статус обновления yt-dlp (NIGHTLY): $status | Версия: $newVer")
+            } catch (e: Exception) {
+                DiagnosticLogger.logError("YTDLP-UPDATE", "Не удалось обновить NIGHTLY, пробую STABLE", e)
+                try {
+                    val status2 = YoutubeDL.getInstance().updateYoutubeDL(
+                        applicationContext,
+                        YoutubeDL.UpdateChannel._STABLE
+                    )
+                    val newVer2 = YoutubeDL.getInstance().version(applicationContext) ?: bundledVer
+                    DiagnosticLogger.log("YTDLP-UPDATE", "Статус обновления yt-dlp (STABLE): $status2 | Версия: $newVer2")
+                } catch (e2: Exception) {
+                    DiagnosticLogger.logError("YTDLP-UPDATE", "Ошибка автообновления yt-dlp", e2)
+                }
+            }
+
             _statusFlow.value = ServiceStatus.IdleListening
             updateNotification("Idle • Listening for Telegram commands (Snapdragon HW Ready)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize native toolchains", e)
+            DiagnosticLogger.logError("YTDLP-INIT", "Критическая ошибка инициализации бинарников", e)
             _statusFlow.value = ServiceStatus.Error("Native init failed: ${e.message}")
             updateNotification("Error: Native toolchain init failed")
         }
@@ -161,10 +210,16 @@ class PipelineForegroundService : LifecycleService() {
         telegramWorker?.stopPolling()
         val token = configStore.getTelegramBotToken()
         if (token.isBlank()) {
+            DiagnosticLogger.log("TELEGRAM", "⚠️ Токен бота пуст! Ожидаю ввода в окне телефона.")
             _statusFlow.value = ServiceStatus.Error("Telegram Bot Token not set (enter in app UI)")
             updateNotification("Waiting for Telegram Bot Token in app UI...")
             return
         }
+
+        DiagnosticLogger.log(
+            "TELEGRAM",
+            "Запуск Long-Polling бота (токен ${token.take(8)}..., allowedChatId=${configStore.getAllowedChatId().ifBlank { "ЛЮБОЙ" }})"
+        )
 
         val worker = TelegramBotWorker(
             context = applicationContext,
@@ -188,11 +243,14 @@ class PipelineForegroundService : LifecycleService() {
     private fun startSequentialJobConsumer() {
         lifecycleScope.launch(renderDispatcher) {
             for (task in jobQueue) {
-                if (!isNativeEnvReady) continue
+                while (!isNativeEnvReady) {
+                    kotlinx.coroutines.delay(500L)
+                }
                 try {
                     task.invoke()
                 } catch (e: Exception) {
                     Log.e(TAG, "Hardware task failed", e)
+                    DiagnosticLogger.logError("WORKER", "Необработанная ошибка задачи", e)
                     _statusFlow.value = ServiceStatus.Error("Task error: ${e.message}")
                 } finally {
                     _statusFlow.value = ServiceStatus.IdleListening
@@ -203,11 +261,12 @@ class PipelineForegroundService : LifecycleService() {
     }
 
     override fun onTimeout(startId: Int) {
-        Log.w(TAG, "Android 14 FGS onTimeout triggered for startId=$startId")
+        DiagnosticLogger.log("SERVICE", "⚠️ Android 14 FGS onTimeout triggered for startId=$startId")
         super.onTimeout(startId)
     }
 
     override fun onDestroy() {
+        DiagnosticLogger.log("SERVICE", "onDestroy() вызван — остановка сервиса.")
         telegramWorker?.stopPolling()
         jobQueue.close()
         powerHelper.releaseAll()

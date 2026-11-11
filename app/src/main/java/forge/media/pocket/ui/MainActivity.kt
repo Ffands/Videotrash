@@ -1,6 +1,9 @@
 package forge.media.pocket.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -22,6 +25,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import forge.media.pocket.config.DiagnosticLogger
 import forge.media.pocket.config.NodeConfigStore
 import forge.media.pocket.service.PipelineForegroundService
 import forge.media.pocket.service.PowerOptimizationHelper
@@ -29,53 +33,61 @@ import forge.media.pocket.service.ServiceStatus
 import kotlinx.coroutines.launch
 import java.io.File
 
-/**
- * Programmatic Zero-XML Dark Control Panel for OnePlus / Snapdragon Node (Step 6 - Option 6C).
- *
- * Why programmatic UI?
- * - Eliminates XML layout inflation issues and R-class resource mismatches in headless CI builds.
- * - Provides direct input fields for Telegram Bot Token, Gemini API Key, Allowed Chat ID,
- *   Ad Banner Text, and Midroll video picker, plus OxygenOS battery whitelist buttons.
- */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var configStore: NodeConfigStore
     private lateinit var powerHelper: PowerOptimizationHelper
 
     private lateinit var statusBadgeView: TextView
-    private lateinit var poolStatsView: TextView
-    private lateinit var tokenInput: EditText
+    private lateinit var poolCountView: TextView
+    private lateinit var midrollStatusView: TextView
+    private lateinit var liveLogTextView: TextView
+
+    private lateinit var botTokenInput: EditText
     private lateinit var geminiKeyInput: EditText
-    private lateinit var chatIdInput: EditText
+    private lateinit var allowedChatIdInput: EditText
     private lateinit var bannerTextInput: EditText
     private lateinit var promoUrlInput: EditText
-    private lateinit var midrollStatusView: TextView
+
+    private val midrollPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            copySelectedMidrollToInternalStorage(uri)
+        }
+    }
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { _ -> }
 
-    private val pickMidrollVideoLauncher = registerForActivityResult(
-        ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            copyMidrollToInternalStorage(uri)
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        DiagnosticLogger.init(applicationContext)
+        DiagnosticLogger.log("UI", "Открыт главный экран MainActivity")
+
         configStore = NodeConfigStore(applicationContext)
         powerHelper = PowerOptimizationHelper(applicationContext)
 
         requestNotificationPermissionIfNeeded()
-        setContentView(buildEngineeringDashboardView())
-        observeServiceStatus()
+        setContentView(buildProgrammaticDarkDashboard())
+        observePipelineStatus()
+        observeDiagnosticLogs()
+        refreshPoolAndAdStats()
+
+        if (configStore.getTelegramBotToken().isNotBlank()) {
+            PipelineForegroundService.startService(applicationContext)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
         refreshPoolAndAdStats()
     }
 
-    private fun buildEngineeringDashboardView(): ScrollView {
-        val scrollView = ScrollView(this).apply {
+    private fun buildProgrammaticDarkDashboard(): ScrollView {
+        val scroll = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#09090B"))
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -89,25 +101,26 @@ class MainActivity : AppCompatActivity() {
             setPadding(pad, dp(28), pad, dp(40))
         }
 
-        // Header Title
-        root.addView(TextView(this).apply {
+        val titleView = TextView(this).apply {
             text = "POCKET MEDIA FORGE"
-            setTextColor(Color.parseColor("#F59E0B"))
+            setTextColor(Color.parseColor("#FFFFFF"))
             textSize = 20f
+            typeface = Typeface.MONOSPACE
             setTypeface(typeface, Typeface.BOLD)
-        })
+        }
+        root.addView(titleView)
 
-        root.addView(TextView(this).apply {
-            text = "Android 14 (API 34) • Qualcomm h264_mediacodec • OxygenOS Node"
+        val subtitleView = TextView(this).apply {
+            text = "Qualcomm Snapdragon ARM64 • Autonomous Shorts Node"
             setTextColor(Color.parseColor("#A1A1AA"))
             textSize = 12f
             setPadding(0, dp(4), 0, dp(16))
-        })
+        }
+        root.addView(subtitleView)
 
-        // Live Service Status Card
         statusBadgeView = TextView(this).apply {
-            text = "STATUS: CHECKING..."
-            setTextColor(Color.parseColor("#10B981"))
+            text = "● СТАТУС: ПРОВЕРКА..."
+            setTextColor(Color.parseColor("#FBBF24"))
             setBackgroundColor(Color.parseColor("#18181B"))
             textSize = 13f
             typeface = Typeface.MONOSPACE
@@ -116,222 +129,246 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(statusBadgeView)
 
-        poolStatsView = TextView(this).apply {
+        poolCountView = TextView(this).apply {
+            text = "Фоновых залипалок в пуле: 0 шт."
             setTextColor(Color.parseColor("#D4D4D8"))
             textSize = 12f
             typeface = Typeface.MONOSPACE
-            setPadding(0, dp(8), 0, dp(16))
+            setPadding(0, dp(10), 0, dp(4))
         }
-        root.addView(poolStatsView)
-
-        // Start / Stop Service Row
-        val serviceRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            weightSum = 2f
-        }
-
-        val startBtn = createStyledButton("▶️ ЗАПУСТИТЬ УЗЕЛ", "#10B981", "#052E16").apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = dp(6)
-            }
-            setOnClickListener {
-                saveInputsToStore()
-                PipelineForegroundService.startService(this@MainActivity)
-                Toast.makeText(this@MainActivity, "Foreground Service запущен", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        val stopBtn = createStyledButton("⏹ ОСТАНОВИТЬ", "#EF4444", "#450A0A").apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(6)
-            }
-            setOnClickListener {
-                PipelineForegroundService.stopService(this@MainActivity)
-                Toast.makeText(this@MainActivity, "Узел остановлен", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        serviceRow.addView(startBtn)
-        serviceRow.addView(stopBtn)
-        root.addView(serviceRow)
-
-        // Section: Credentials (Hybrid 6C)
-        root.addView(sectionHeader("1. КЛЮЧИ И ДОСТУП (СОХРАНЯЮТСЯ НА ТЕЛЕФОНЕ)"))
-
-        tokenInput = createInputField(
-            hint = "Telegram Bot Token (123456:ABC-DEF...)",
-            initial = configStore.getTelegramBotToken(),
-            isSecret = true
-        )
-        root.addView(fieldLabel("Telegram Bot Token:"))
-        root.addView(tokenInput)
-
-        geminiKeyInput = createInputField(
-            hint = "Gemini API Key (AIzaSy...)",
-            initial = configStore.getGeminiApiKey(),
-            isSecret = true
-        )
-        root.addView(fieldLabel("Gemini 2.5 Flash API Key:"))
-        root.addView(geminiKeyInput)
-
-        chatIdInput = createInputField(
-            hint = "Твой Telegram Chat ID или ID канала (пусто = доступен всем)",
-            initial = configStore.getAllowedChatId(),
-            isSecret = false
-        )
-        root.addView(fieldLabel("Разрешённый Chat ID (Белый список):"))
-        root.addView(chatIdInput)
-
-        // Section: Ad Engine Assets
-        root.addView(sectionHeader("2. РЕКЛАМНЫЙ ДВИЖОК (БАННЕР / МИДРОЛЛ / ССЫЛКА)"))
-
-        bannerTextInput = createInputField(
-            hint = "Текст рекламной плашки",
-            initial = configStore.getCustomBannerText(),
-            isSecret = false
-        )
-        root.addView(fieldLabel("Текст для баннера (Strategy A):"))
-        root.addView(bannerTextInput)
-
-        promoUrlInput = createInputField(
-            hint = "Промо-хук и ссылка для закрепа (Strategy C)",
-            initial = configStore.getSponsorPromoUrl(),
-            isSecret = false
-        )
-        root.addView(fieldLabel("Промо-текст и ссылка в закреп (Strategy C):"))
-        root.addView(promoUrlInput)
+        root.addView(poolCountView)
 
         midrollStatusView = TextView(this).apply {
-            setTextColor(Color.parseColor("#A1A1AA"))
+            text = "3-сек видео-врезка (Midroll): не загружена"
+            setTextColor(Color.parseColor("#D4D4D8"))
             textSize = 12f
-            setPadding(0, dp(8), 0, dp(6))
+            typeface = Typeface.MONOSPACE
+            setPadding(0, 0, 0, dp(18))
         }
         root.addView(midrollStatusView)
 
-        root.addView(createStyledButton("📂 ВЫБРАТЬ 3-СЕК МИДРОЛЛ (.MP4) С ТЕЛЕФОНА", "#E4E4E7", "#27272A").apply {
-            setOnClickListener {
-                pickMidrollVideoLauncher.launch("video/mp4")
-            }
-        })
+        // Live Diagnostic Log section right at the top so user immediately sees what is happening!
+        root.addView(sectionHeader("0. ПОЛНЫЙ ЛОГ ДЕЙСТВИЙ С ЗАПУСКА (LIVE)"))
 
-        root.addView(createStyledButton("💾 СОХРАНИТЬ КЛЮЧИ И ПРИМЕНИТЬ НА ЛЕТУ", "#F59E0B", "#451A03").apply {
-            val lp = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(14)
-            }
-            layoutParams = lp
-            setOnClickListener {
-                saveInputsToStore()
-                PipelineForegroundService.reloadCredentials(this@MainActivity)
-                Toast.makeText(this@MainActivity, "Ключи сохранены и применены!", Toast.LENGTH_SHORT).show()
-            }
-        })
+        liveLogTextView = TextView(this).apply {
+            text = DiagnosticLogger.getRecentLinesText(30)
+            setTextColor(Color.parseColor("#34D399"))
+            setBackgroundColor(Color.parseColor("#111115"))
+            textSize = 10.5f
+            typeface = Typeface.MONOSPACE
+            val p = dp(12)
+            setPadding(p, p, p, p)
+        }
+        root.addView(liveLogTextView)
 
-        // Section: OxygenOS / ColorOS Power Exemptions
-        root.addView(sectionHeader("3. ЗАЩИТА ОТ УБИЙСТВА ПРОЦЕССА (OXYGENOS / COLOROS)"))
-
-        root.addView(createStyledButton("🔋 1. ОТКЛЮЧИТЬ КОНТРОЛЬ БАТАРЕИ (DOZE)", "#38BDF8", "#082F49").apply {
+        val copyLogBtn = createStyledButton(
+            text = "📋 Скопировать весь лог в буфер обмена",
+            textColorHex = "#E4E4E7",
+            bgHex = "#27272A"
+        ).apply {
             setOnClickListener {
-                startActivity(powerHelper.buildIgnoreBatteryOptimizationIntent())
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val fullText = DiagnosticLogger.getFullLogFile(applicationContext).readText()
+                cm.setPrimaryClip(ClipData.newPlainText("PocketForgeLog", fullText))
+                Toast.makeText(this@MainActivity, "✅ Весь лог скопирован в буфер!", Toast.LENGTH_SHORT).show()
             }
-        })
+        }
+        root.addView(copyLogBtn, buttonLayoutParams())
 
-        root.addView(createStyledButton("🛡 2. ОТКРЫТЬ АВТОЗАПУСК OXYGENOS / COLOROS", "#A78BFA", "#2E1065").apply {
-            val lp = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(8)
-            }
-            layoutParams = lp
+        root.addView(sectionHeader("1. КЛЮЧИ УПРАВЛЕНИЯ (СОХРАНЯЮТСЯ В ПАМЯТИ ТЕЛЕФОНА)"))
+
+        root.addView(fieldLabel("Telegram Bot Token (от @BotFather):"))
+        botTokenInput = createInputField(
+            hint = "123456789:AAH...",
+            initial = configStore.getTelegramBotToken(),
+            isSecret = false
+        )
+        root.addView(botTokenInput)
+
+        root.addView(fieldLabel("Gemini API Key (для 3 названий и AI-субтитров):"))
+        geminiKeyInput = createInputField(
+            hint = "AIzaSy...",
+            initial = configStore.getGeminiApiKey(),
+            isSecret = false
+        )
+        root.addView(geminiKeyInput)
+
+        root.addView(fieldLabel("Разрешённый Chat ID (оставь пустым для любого чата):"))
+        allowedChatIdInput = createInputField(
+            hint = "Например: -100192837465 или твой ID",
+            initial = configStore.getAllowedChatId(),
+            isSecret = false
+        )
+        root.addView(allowedChatIdInput)
+
+        root.addView(sectionHeader("2. НАСТРОЙКИ РЕКЛАМЫ ПО УМОЛЧАНИЮ (ДЛЯ СЛОЯ 4)"))
+
+        root.addView(fieldLabel("Текст всплывающей плашки (5–15 сек):"))
+        bannerTextInput = createInputField(
+            hint = "SPONSORED • ССЫЛКА В ЗАКРЕПЕ",
+            initial = configStore.getCustomBannerText(),
+            isSecret = false
+        )
+        root.addView(bannerTextInput)
+
+        root.addView(fieldLabel("Промо-ссылка / промокод для закреплённого комментария:"))
+        promoUrlInput = createInputField(
+            hint = "https://t.me/+...",
+            initial = configStore.getSponsorPromoUrl(),
+            isSecret = false
+        )
+        root.addView(promoUrlInput)
+
+        val pickMidrollBtn = createStyledButton(
+            text = "📂 Выбрать MP4 с телефона для 3-сек видео-врезки",
+            textColorHex = "#F4F4F5",
+            bgHex = "#27272A"
+        ).apply {
             setOnClickListener {
-                val intent = powerHelper.buildOxygenOsAutoLaunchIntent()
-                if (intent != null) {
-                    startActivity(intent)
+                midrollPickerLauncher.launch("video/mp4")
+            }
+        }
+        root.addView(pickMidrollBtn, buttonLayoutParams())
+
+        root.addView(sectionHeader("3. ЗАЩИТА ОТ СНА OXYGENOS (ONEPLUS)"))
+
+        val batteryBtn = createStyledButton(
+            text = "🔋 Отключить оптимизацию батареи для узла",
+            textColorHex = "#FBBF24",
+            bgHex = "#27272A"
+        ).apply {
+            setOnClickListener {
+                if (!powerHelper.isIgnoringBatteryOptimizations()) {
+                    startActivity(powerHelper.buildIgnoreBatteryOptimizationIntent())
                 } else {
-                    Toast.makeText(
-                        this@MainActivity,
-                        "Спец-меню ColorOS не найдено, достаточно стандартного отключения Doze",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    val oplusIntent = powerHelper.buildOxygenOsAutoLaunchIntent()
+                    if (oplusIntent != null) {
+                        startActivity(oplusIntent)
+                    } else {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Оптимизация батареи уже отключена ✅",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                 }
             }
-        })
+        }
+        root.addView(batteryBtn, buttonLayoutParams())
 
-        root.addView(createStyledButton("🧹 ОЧИСТИТЬ ВРЕМЕННЫЙ КЭШ СБОРКИ", "#A1A1AA", "#18181B").apply {
-            val lp = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(16)
-            }
-            layoutParams = lp
+        root.addView(sectionHeader("4. ЗАПУСК И ПЕРЕЗАПУСК КОНВЕЙЕРА"))
+
+        val saveAndStartBtn = createStyledButton(
+            text = "🚀 СОХРАНИТЬ НАСТРОЙКИ И ЗАПУСТИТЬ УЗЕЛ 24/7",
+            textColorHex = "#09090B",
+            bgHex = "#10B981"
+        ).apply {
+            setTypeface(typeface, Typeface.BOLD)
             setOnClickListener {
-                File(cacheDir, "work_staging").deleteRecursively()
-                File(cacheDir, "work_staging").mkdirs()
+                saveInputsToStore()
+                PipelineForegroundService.reloadCredentials(applicationContext)
+                Toast.makeText(
+                    this@MainActivity,
+                    "Настройки сохранены! Узел и Telegram-бот запущены.",
+                    Toast.LENGTH_LONG
+                ).show()
                 refreshPoolAndAdStats()
-                Toast.makeText(this@MainActivity, "Временный кэш очищен", Toast.LENGTH_SHORT).show()
             }
-        })
+        }
+        root.addView(saveAndStartBtn, buttonLayoutParams())
 
-        scrollView.addView(root)
-        return scrollView
+        val stopBtn = createStyledButton(
+            text = "🛑 ОСТАНОВИТЬ ФОНОВЫЙ УЗЕЛ",
+            textColorHex = "#FCA5A5",
+            bgHex = "#3F1D1D"
+        ).apply {
+            setOnClickListener {
+                PipelineForegroundService.stopService(applicationContext)
+                Toast.makeText(this@MainActivity, "Узел остановлен", Toast.LENGTH_SHORT).show()
+            }
+        }
+        root.addView(stopBtn, buttonLayoutParams())
+
+        scroll.addView(root)
+        return scroll
     }
 
     private fun saveInputsToStore() {
-        configStore.setTelegramBotToken(tokenInput.text.toString())
+        configStore.setTelegramBotToken(botTokenInput.text.toString())
         configStore.setGeminiApiKey(geminiKeyInput.text.toString())
-        configStore.setAllowedChatId(chatIdInput.text.toString())
+        configStore.setAllowedChatId(allowedChatIdInput.text.toString())
         configStore.setCustomBannerText(bannerTextInput.text.toString())
         configStore.setSponsorPromoUrl(promoUrlInput.text.toString())
-        refreshPoolAndAdStats()
+        DiagnosticLogger.log("UI", "Пользователь сохранил настройки и перезапустил узел.")
     }
 
-    private fun copyMidrollToInternalStorage(uri: Uri) {
+    private fun copySelectedMidrollToInternalStorage(uri: Uri) {
         try {
             val adDir = File(filesDir, "ad_assets").apply { mkdirs() }
-            val dest = File(adDir, "midroll.mp4")
+            val target = File(adDir, "midroll.mp4")
             contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { output ->
+                target.outputStream().use { output ->
                     input.copyTo(output)
                 }
             }
             refreshPoolAndAdStats()
-            Toast.makeText(this, "Мидролл сохранён (${dest.length() / 1024} КБ)", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                "✅ Видео-врезка midroll.mp4 сохранена (${target.length() / 1024} KB)",
+                Toast.LENGTH_LONG
+            ).show()
         } catch (e: Exception) {
-            Toast.makeText(this, "Ошибка копирования мидролла: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Ошибка копирования видео: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
     private fun refreshPoolAndAdStats() {
-        val poolCount = File(filesDir, "clutter_pool").listFiles { f -> f.extension == "mp4" }?.size ?: 0
-        val batteryOk = powerHelper.isIgnoringBatteryOptimizations()
-        poolStatsView.text = "Clutter Pool: $poolCount clips | Doze Exemption: ${if (batteryOk) "GRANTED" else "NOT GRANTED"}"
+        val poolDir = File(filesDir, "clutter_pool")
+        val count = poolDir.listFiles { f -> f.isFile && f.extension == "mp4" }?.size ?: 0
+        val batteryOk = if (powerHelper.isIgnoringBatteryOptimizations()) "Да ✅" else "Нет ⚠️"
+        poolCountView.text = "Фоновых залипалок в пуле: $count шт. • Игнор батареи: $batteryOk"
 
         val midroll = configStore.getMidrollVideoFile()
         midrollStatusView.text = if (midroll != null) {
-            "Мидролл (Strategy B): Загружен (${midroll.length() / 1024} KB)"
+            "3-сек видео-врезка (Midroll): загружена ✅ (${midroll.length() / 1024} KB)"
         } else {
-            "Мидролл (Strategy B): Не выбран"
+            "3-сек видео-врезка (Midroll): не выбрана (можно выбрать кнопкой ниже)"
         }
     }
 
-    private fun observeServiceStatus() {
+    private fun observePipelineStatus() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 PipelineForegroundService.statusFlow.collect { status ->
                     val (text, colorHex) = when (status) {
-                        is ServiceStatus.Stopped -> "⏹ УЗЕЛ ОСТАНОВЛЕН" to "#A1A1AA"
-                        is ServiceStatus.Initializing -> "⏳ ИНИЦИАЛИЗАЦИЯ YT-DLP & ARIA2C..." to "#F59E0B"
-                        is ServiceStatus.IdleListening -> "🟢 ОНЛАЙН • СЛУШАЮ КОМАНДЫ В TELEGRAM" to "#10B981"
-                        is ServiceStatus.Processing -> "⚙️ РЕНДЕР #${status.jobId}: ${status.stage}" to "#38BDF8"
-                        is ServiceStatus.Error -> "⚠️ ${status.reason}" to "#EF4444"
+                        is ServiceStatus.Stopped ->
+                            "● СТАТУС: ОСТАНОВЛЕН (Нажми зелёную кнопку запуска)" to "#F87171"
+                        is ServiceStatus.Initializing ->
+                            "● СТАТУС: ИНИЦИАЛИЗАЦИЯ И ОБНОВЛЕНИЕ YT-DLP..." to "#FBBF24"
+                        is ServiceStatus.IdleListening ->
+                            "● СТАТУС: ОНЛАЙН • СЛУШАЮ КОМАНДЫ TELEGRAM (24/7)" to "#34D399"
+                        is ServiceStatus.Processing ->
+                            "● В РАБОТЕ [#${status.jobId}]: ${status.stage}" to "#38BDF8"
+                        is ServiceStatus.Error ->
+                            "● ВНИМАНИЕ: ${status.reason}" to "#FB923C"
                     }
                     statusBadgeView.text = text
                     statusBadgeView.setTextColor(Color.parseColor(colorHex))
                     refreshPoolAndAdStats()
+                }
+            }
+        }
+    }
+
+    private fun observeDiagnosticLogs() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                DiagnosticLogger.logFlow.collect { lines ->
+                    liveLogTextView.text = if (lines.isEmpty()) {
+                        "Лог пока пуст..."
+                    } else {
+                        lines.takeLast(30).joinToString("\n")
+                    }
                 }
             }
         }
@@ -393,6 +430,14 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER
             val p = dp(12)
             setPadding(p, p, p, p)
+        }
+
+    private fun buttonLayoutParams(): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = dp(10)
         }
 
     private fun dp(value: Int): Int =
