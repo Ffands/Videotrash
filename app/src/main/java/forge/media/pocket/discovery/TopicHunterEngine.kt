@@ -26,10 +26,10 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 enum class ContentSortOrder(val label: String) {
-    POPULAR("🔥 По популярности (Просмотры/Рейтинг)"),
+    POPULAR("🔥 По популярности"),
     NEWEST("🆕 По новизне (Свежие)"),
-    VIRAL_VELOCITY("📈 Взлетающие (Просмотры в день)"),
-    RELEVANCE("🎯 По точному совпадению тегов")
+    VIRAL_VELOCITY("📈 Взлетающие"),
+    RELEVANCE("🎯 По совпадению")
 }
 
 enum class SearchTimePeriod(val label: String, val daysBack: Int?, val redditParam: String) {
@@ -42,7 +42,7 @@ enum class SearchTimePeriod(val label: String, val daysBack: Int?, val redditPar
 
 enum class HuntPlatform(val label: String) {
     ALL("🌐 Все площадки"),
-    YOUTUBE("▶️ YouTube Clips/Shorts"),
+    YOUTUBE("▶️ YouTube Shorts/Clips"),
     REDDIT("👽 Reddit Video"),
     PIKABU("🟠 Пикабу Видео")
 }
@@ -97,6 +97,7 @@ class TopicHunterEngine(private val context: Context) {
         @SerialName("webpage_url") val webpageUrl: String? = null,
         val title: String = "",
         val uploader: String? = null,
+        val channel: String? = null,
         val duration: Double? = null,
         @SerialName("view_count") val viewCount: Long? = null,
         @SerialName("upload_date") val uploadDate: String? = null
@@ -140,22 +141,31 @@ class TopicHunterEngine(private val context: Context) {
         val duration: Int = 0
     )
 
+    private fun sanitizeQuery(rawQuery: String): String {
+        return rawQuery
+            .replace("#", " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .ifBlank { rawQuery.trim() }
+    }
+
     suspend fun huntByTags(
         queryTags: String,
         platform: HuntPlatform = HuntPlatform.ALL,
         sortOrder: ContentSortOrder = ContentSortOrder.POPULAR,
         period: SearchTimePeriod = SearchTimePeriod.WEEK,
         limitCount: Int = 3,
-        minDurationSec: Int = 10,
-        maxDurationSec: Int = 75
+        minDurationSec: Int = 5,
+        maxDurationSec: Int = 90
     ): List<DiscoveredMediaCandidate> = withContext(Dispatchers.IO) {
+        val cleanQuery = sanitizeQuery(queryTags)
         val seenIds = loadSeenIds()
         val rawPool = mutableListOf<DiscoveredMediaCandidate>()
 
         if (platform == HuntPlatform.ALL || platform == HuntPlatform.YOUTUBE) {
             rawPool.addAll(
                 searchYouTubeByTags(
-                    queryTags = queryTags,
+                    queryTags = cleanQuery,
                     sortOrder = sortOrder,
                     period = period,
                     minDurationSec = minDurationSec,
@@ -167,7 +177,7 @@ class TopicHunterEngine(private val context: Context) {
         if (platform == HuntPlatform.ALL || platform == HuntPlatform.REDDIT) {
             rawPool.addAll(
                 searchRedditVideosByTags(
-                    queryTags = queryTags,
+                    queryTags = cleanQuery,
                     sortOrder = sortOrder,
                     period = period,
                     maxDurationSec = maxDurationSec
@@ -178,16 +188,22 @@ class TopicHunterEngine(private val context: Context) {
         if (platform == HuntPlatform.ALL || platform == HuntPlatform.PIKABU) {
             rawPool.addAll(
                 searchPikabuByTags(
-                    queryTags = queryTags,
+                    queryTags = cleanQuery,
                     sortOrder = sortOrder,
-                    period = period,
                     maxDurationSec = maxDurationSec
                 )
             )
         }
 
-        val unseenCandidates = rawPool.filter { candidate ->
+        val deduplicatedPool = rawPool.distinctBy { it.id }
+
+        var unseenCandidates = deduplicatedPool.filter { candidate ->
             candidate.id.isNotBlank() && !seenIds.contains(candidate.id)
+        }
+
+        // If all discovered items were already seen before, allow top results so user never gets stuck with 0 results
+        if (unseenCandidates.isEmpty() && deduplicatedPool.isNotEmpty()) {
+            unseenCandidates = deduplicatedPool
         }
 
         val sortedCandidates = when (sortOrder) {
@@ -219,14 +235,27 @@ class TopicHunterEngine(private val context: Context) {
                 else -> "ytsearch25"
             }
 
-            val request = YoutubeDLRequest("$searchPrefix:$queryTags").apply {
+            // Append shorts keyword if user didn't specify it so YouTube prioritizes 15-60s clips
+            val queryWithShortsHint = if (
+                queryTags.lowercase().contains("short") ||
+                queryTags.lowercase().contains("клип") ||
+                queryTags.lowercase().contains("эдит") ||
+                queryTags.lowercase().contains("edit")
+            ) {
+                queryTags
+            } else {
+                "$queryTags shorts"
+            }
+
+            // CRITICAL: Use --flat-playlist --dump-json (and NO --no-playlist / --dateafter)
+            // so yt-dlp parses search results in ~1.5 seconds instead of failing on 25 full page loads
+            val request = YoutubeDLRequest("$searchPrefix:$queryWithShortsHint").apply {
+                addOption("--flat-playlist")
                 addOption("--dump-json")
-                addOption("--no-playlist")
                 addOption("--skip-download")
-                addOption("--match-filter", "duration >= $minDurationSec & duration <= $maxDurationSec")
-                period.daysBack?.let { days ->
-                    addOption("--dateafter", "now-${days}days")
-                }
+                addOption("--ignore-errors")
+                addOption("--no-check-certificates")
+                addOption("--geo-bypass")
             }
 
             val response = YoutubeDL.getInstance().execute(request)
@@ -236,18 +265,26 @@ class TopicHunterEngine(private val context: Context) {
             for (line in lines) {
                 try {
                     val item = jsonFormat.decodeFromString<YtDlpFlatEntry>(line)
-                    val resolvedUrl = item.webpageUrl ?: item.url ?: continue
-                    val dur = (item.duration ?: 30.0).toInt()
+                    if (item.id.isBlank()) continue
+
+                    val rawUrl = item.webpageUrl ?: item.url ?: ""
+                    val resolvedUrl = when {
+                        rawUrl.startsWith("http") -> rawUrl
+                        else -> "https://www.youtube.com/watch?v=${item.id}"
+                    }
+
+                    // In --flat-playlist mode, Shorts sometimes omit duration (null); default to 30s
+                    val dur = item.duration?.toInt() ?: 30
                     if (dur in minDurationSec..maxDurationSec) {
                         results.add(
                             DiscoveredMediaCandidate(
                                 id = "yt_${item.id}",
                                 url = resolvedUrl,
-                                title = item.title,
-                                author = item.uploader ?: "YouTube Creator",
+                                title = item.title.ifBlank { "YouTube Short #${item.id}" },
+                                author = item.uploader ?: item.channel ?: "YouTube Creator",
                                 platform = HuntPlatform.YOUTUBE,
                                 durationSec = dur,
-                                viewOrScoreCount = item.viewCount ?: 0L,
+                                viewOrScoreCount = item.viewCount ?: 1000L,
                                 uploadDateYmd = item.uploadDate ?: ""
                             )
                         )
@@ -255,6 +292,7 @@ class TopicHunterEngine(private val context: Context) {
                 } catch (_: Exception) {
                 }
             }
+            Log.i(TAG, "YouTube search for '$queryWithShortsHint' returned ${results.size} candidates")
             results
         } catch (e: Exception) {
             Log.w(TAG, "YouTube tag search warning for '$queryTags': ${e.message}")
@@ -278,7 +316,7 @@ class TopicHunterEngine(private val context: Context) {
 
             val listing: RedditSearchListing = httpClient.get("https://www.reddit.com/search.json") {
                 header(HttpHeaders.UserAgent, "android:forge.media.pocket:v1.2.0 (by /u/pocketforge)")
-                parameter("q", "$queryTags site:v.redd.it")
+                parameter("q", "$queryTags")
                 parameter("sort", redditSort)
                 parameter("t", period.redditParam)
                 parameter("limit", 25)
@@ -292,7 +330,8 @@ class TopicHunterEngine(private val context: Context) {
                 ?.mapNotNull { post ->
                     val video = post.media?.redditVideo ?: return@mapNotNull null
                     val url = video.fallbackUrl ?: return@mapNotNull null
-                    if (video.duration <= 0 || video.duration > maxDurationSec) return@mapNotNull null
+                    val dur = if (video.duration > 0) video.duration else 25
+                    if (dur > maxDurationSec) return@mapNotNull null
 
                     val dateStr = if (post.createdUtc > 0) {
                         sdf.format(java.util.Date((post.createdUtc * 1000).toLong()))
@@ -306,7 +345,7 @@ class TopicHunterEngine(private val context: Context) {
                         title = post.title,
                         author = "u/${post.author}",
                         platform = HuntPlatform.REDDIT,
-                        durationSec = video.duration,
+                        durationSec = dur,
                         viewOrScoreCount = post.score,
                         uploadDateYmd = dateStr
                     )
@@ -320,11 +359,11 @@ class TopicHunterEngine(private val context: Context) {
     private fun searchPikabuByTags(
         queryTags: String,
         sortOrder: ContentSortOrder,
-        period: SearchTimePeriod,
         maxDurationSec: Int
     ): List<DiscoveredMediaCandidate> {
         return try {
-            val encodedTag = java.net.URLEncoder.encode(queryTags.trim(), "UTF-8")
+            val firstTag = queryTags.split(" ").firstOrNull { it.isNotBlank() } ?: queryTags
+            val encodedTag = java.net.URLEncoder.encode(firstTag.trim(), "UTF-8")
             val sortPath = when (sortOrder) {
                 ContentSortOrder.NEWEST -> "?n=4"
                 ContentSortOrder.POPULAR -> "?r=4"
@@ -333,12 +372,11 @@ class TopicHunterEngine(private val context: Context) {
             val pikabuSearchUrl = "https://pikabu.ru/tag/$encodedTag/video$sortPath"
 
             val request = YoutubeDLRequest(pikabuSearchUrl).apply {
+                addOption("--flat-playlist")
                 addOption("--dump-json")
                 addOption("--playlist-end", "12")
                 addOption("--skip-download")
-                period.daysBack?.let { days ->
-                    addOption("--dateafter", "now-${days}days")
-                }
+                addOption("--ignore-errors")
             }
 
             val response = YoutubeDL.getInstance().execute(request)

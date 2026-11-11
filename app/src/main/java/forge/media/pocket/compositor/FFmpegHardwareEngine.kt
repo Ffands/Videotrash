@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.util.Log
 import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.ReturnCode
 import forge.media.pocket.subtitles.SubtitleLayerConfig
 import forge.media.pocket.vision.UpperBoxFramingPlan
@@ -16,10 +17,10 @@ import kotlin.coroutines.resume
 import kotlin.random.Random
 
 enum class VideoLayoutLayer(val label: String) {
-    SPLIT_VSTACK("Сплит 50/50 (Спикер + Залипалка)"),
-    FULLSCREEN_EDIT("Полноэкранный Эдит 9:16"),
-    BRAINROT_VOICEOVER("Геймплей на весь экран + Озвучка"),
-    DISTORTED_ORIGINAL("Искажённый оригинал (Анти-Content ID)")
+    SPLIT_VSTACK("Сплит 50/50 (Верх + Фон)"),
+    FULLSCREEN_EDIT("На весь экран 9:16 (Эдит)"),
+    BRAINROT_VOICEOVER("Фон 9:16 + Озвучка из видео"),
+    DISTORTED_ORIGINAL("Оригинал + Анти-Детект")
 }
 
 enum class AdInsertionMode {
@@ -32,19 +33,19 @@ enum class AdInsertionMode {
 
 data class AdLayerConfig(
     val mode: AdInsertionMode = AdInsertionMode.NONE,
-    val bannerText: String = "SPONSORED • LINK IN PINNED COMMENT",
     val bannerImageFile: File? = null,
+    val bannerText: String = "Подпишись • Ссылка в закрепе",
     val bannerStartSec: Int = 5,
     val bannerEndSec: Int = 15,
     val midrollClipFile: File? = null,
-    val sponsorTrackingUrl: String = ""
+    val promoLinkForComment: String = ""
 )
 
 data class AntiDetectDspLayerConfig(
     val enabled: Boolean = true,
-    val enableAudioPitchTempoMicroJitter: Boolean = true,
-    val enableSilenceTrimming350ms: Boolean = true,
     val enableMicroZoom: Boolean = true,
+    val enableSilenceTrimming350ms: Boolean = true,
+    val enableAudioPitchTempoMicroJitter: Boolean = true,
     val enableVideoNoiseInjection: Boolean = true,
     val enableMicroColorEqShift: Boolean = true
 )
@@ -52,20 +53,66 @@ data class AntiDetectDspLayerConfig(
 data class ModularRenderConfig(
     val layoutLayer: VideoLayoutLayer = VideoLayoutLayer.SPLIT_VSTACK,
     val enableSmartFaceCrop: Boolean = true,
-    val subtitleLayer: SubtitleLayerConfig = SubtitleLayerConfig(),
-    val adLayer: AdLayerConfig = AdLayerConfig(),
-    val dspLayer: AntiDetectDspLayerConfig = AntiDetectDspLayerConfig(),
+    val subtitleLayer: SubtitleLayerConfig = SubtitleLayerConfig(enabled = true),
+    val adLayer: AdLayerConfig = AdLayerConfig(mode = AdInsertionMode.NONE),
+    val dspLayer: AntiDetectDspLayerConfig = AntiDetectDspLayerConfig(enabled = true),
     val enableAiMetadataGeneration: Boolean = true,
-    val videoBitrateKbps: Int = 6000
-)
+    val videoBitrateKbps: Int = 5800
+) {
+    companion object {
+        fun presetPodcastSplit() = ModularRenderConfig(
+            layoutLayer = VideoLayoutLayer.SPLIT_VSTACK,
+            enableSmartFaceCrop = true,
+            subtitleLayer = SubtitleLayerConfig(enabled = true),
+            dspLayer = AntiDetectDspLayerConfig(enabled = true)
+        )
+
+        fun presetFullscreenEdit() = ModularRenderConfig(
+            layoutLayer = VideoLayoutLayer.FULLSCREEN_EDIT,
+            enableSmartFaceCrop = false,
+            subtitleLayer = SubtitleLayerConfig(enabled = false),
+            dspLayer = AntiDetectDspLayerConfig(
+                enabled = true,
+                enableSilenceTrimming350ms = false
+            )
+        )
+
+        fun presetBrainrotStory() = ModularRenderConfig(
+            layoutLayer = VideoLayoutLayer.BRAINROT_VOICEOVER,
+            enableSmartFaceCrop = false,
+            subtitleLayer = SubtitleLayerConfig(enabled = true),
+            dspLayer = AntiDetectDspLayerConfig(enabled = true)
+        )
+
+        fun presetDistortedOriginal() = ModularRenderConfig(
+            layoutLayer = VideoLayoutLayer.DISTORTED_ORIGINAL,
+            enableSmartFaceCrop = false,
+            subtitleLayer = SubtitleLayerConfig(enabled = false),
+            dspLayer = AntiDetectDspLayerConfig(enabled = true)
+        )
+    }
+}
 
 class FFmpegHardwareEngine(private val context: Context) {
 
     companion object {
-        private const val TAG = "FFmpegHardwareEngine"
+        private const val TAG = "FFmpegHwEngine"
+        private const val PREVIEW_DURATION_SEC = 5
     }
 
     private val stagingDir = File(context.cacheDir, "work_staging").apply { mkdirs() }
+
+    init {
+        try {
+            FFmpegKitConfig.setFontDirectoryList(
+                context,
+                listOf("/system/fonts", "/system/font"),
+                emptyMap()
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Font directory registration warning: ${e.message}")
+        }
+    }
 
     suspend fun renderPipeline(
         primaryVideoFile: File,
@@ -75,25 +122,19 @@ class FFmpegHardwareEngine(private val context: Context) {
         config: ModularRenderConfig,
         isPreviewPass: Boolean
     ): File = withContext(Dispatchers.IO) {
-        val totalDurationSec = probeDurationSeconds(primaryVideoFile).coerceAtLeast(5.0)
+        val totalDurationSec = probeDurationSeconds(primaryVideoFile)
         val renderDurationSec = if (isPreviewPass) {
-            5.0
+            PREVIEW_DURATION_SEC.toDouble().coerceAtMost(totalDurationSec)
         } else {
-            totalDurationSec.coerceAtMost(90.0)
+            totalDurationSec.coerceIn(5.0, 75.0)
         }
 
-        val previewStartOffsetSec = if (isPreviewPass && totalDurationSec > 8.0) 2.0 else 0.0
+        val previewStartOffsetSec = if (isPreviewPass && totalDurationSec > 12.0) 3.0 else 0.0
 
-        val outFile = File(
-            stagingDir,
-            if (isPreviewPass) {
-                "preview_5s_${System.currentTimeMillis()}.mp4"
-            } else {
-                "final_render_${System.currentTimeMillis()}.mp4"
-            }
-        )
+        val suffix = if (isPreviewPass) "preview_5s" else "final_master"
+        val outFile = File(stagingDir, "render_${suffix}_${System.currentTimeMillis()}.mp4")
 
-        val command = buildModularFFmpegCommand(
+        val hwCommand = buildModularFFmpegCommand(
             primaryVideoFile = primaryVideoFile,
             clutterReelFile = clutterReelFile,
             framingPlan = framingPlan,
@@ -102,16 +143,36 @@ class FFmpegHardwareEngine(private val context: Context) {
             startOffsetSec = previewStartOffsetSec,
             durationSec = renderDurationSec,
             isPreviewPass = isPreviewPass,
+            useHardwareCodec = true,
             outputFile = outFile
         )
 
-        Log.i(TAG, "Executing Qualcomm h264_mediacodec command: $command")
+        Log.i(TAG, "Executing Qualcomm h264_mediacodec command: $hwCommand")
 
-        val success = executeHardwareCommand(command)
-        if (!success || !outFile.exists() || outFile.length() == 0L) {
-            throw IllegalStateException(
-                "Qualcomm h264_mediacodec hardware render failed (Option 2B strict mode)."
-            )
+        val hwSuccess = executeFFmpegCommand(hwCommand)
+        if (hwSuccess && outFile.exists() && outFile.length() > 10_000L) {
+            return@withContext outFile
+        }
+
+        // Automatic fallback to libx264 ultrafast if MediaCodec is busy (e.g. PiP active)
+        outFile.delete()
+        val swCommand = buildModularFFmpegCommand(
+            primaryVideoFile = primaryVideoFile,
+            clutterReelFile = clutterReelFile,
+            framingPlan = framingPlan,
+            assSubtitleFile = assSubtitleFile,
+            config = config,
+            startOffsetSec = previewStartOffsetSec,
+            durationSec = renderDurationSec,
+            isPreviewPass = isPreviewPass,
+            useHardwareCodec = false,
+            outputFile = outFile
+        )
+        Log.w(TAG, "h264_mediacodec busy/failed, falling back to libx264 ultrafast: $swCommand")
+
+        val swSuccess = executeFFmpegCommand(swCommand)
+        if (!swSuccess || !outFile.exists() || outFile.length() == 0L) {
+            throw IllegalStateException("Ошибка рендера FFmpeg (проверьте исходное видео).")
         }
 
         outFile
@@ -139,6 +200,7 @@ class FFmpegHardwareEngine(private val context: Context) {
         startOffsetSec: Double,
         durationSec: Double,
         isPreviewPass: Boolean,
+        useHardwareCodec: Boolean,
         outputFile: File
     ): String {
         val inputs = mutableListOf<String>()
@@ -156,7 +218,7 @@ class FFmpegHardwareEngine(private val context: Context) {
         val needsClutterStream =
             (config.layoutLayer == VideoLayoutLayer.SPLIT_VSTACK ||
                 config.layoutLayer == VideoLayoutLayer.BRAINROT_VOICEOVER) &&
-                clutterReelFile != null
+                clutterReelFile != null && clutterReelFile.exists()
 
         if (needsClutterStream) {
             clutterInputIndex = nextInputIndex++
@@ -246,7 +308,7 @@ class FFmpegHardwareEngine(private val context: Context) {
                 .replace("\\", "/")
                 .replace(":", "\\:")
                 .replace("'", "\\'")
-            filterStages.add("$currentVideoLabel" + "ass=filename='$escapedAssPath'[v_sub]")
+            filterStages.add("$currentVideoLabel" + "ass=filename='$escapedAssPath':fontsdir='/system/fonts'[v_sub]")
             currentVideoLabel = "[v_sub]"
         }
 
@@ -291,7 +353,7 @@ class FFmpegHardwareEngine(private val context: Context) {
                     filterStages.add(
                         "$currentVideoLabel" +
                             "drawbox=x=60:y=110:w=960:h=96:color=black@0.78:t=fill:enable='between(t,$startT,$endT)'," +
-                            "drawtext=text='$safeBannerText':fontsize=36:fontcolor=yellow:" +
+                            "drawtext=fontfile='/system/fonts/Roboto-Regular.ttf':text='$safeBannerText':fontsize=36:fontcolor=yellow:" +
                             "x=(w-text_w)/2:y=142:enable='between(t,$startT,$endT)'[v_ad]"
                     )
                     currentVideoLabel = "[v_ad]"
@@ -335,7 +397,8 @@ class FFmpegHardwareEngine(private val context: Context) {
             }
         }
 
-        filterStages.add("$currentVideoLabel" + "format=nv12[v_out]")
+        val targetPixFmt = if (useHardwareCodec) "nv12" else "yuv420p"
+        filterStages.add("$currentVideoLabel" + "format=$targetPixFmt[v_out]")
 
         val filterComplex = filterStages.joinToString(";")
 
@@ -351,19 +414,23 @@ class FFmpegHardwareEngine(private val context: Context) {
             append(inputs.joinToString(" "))
             append(" -filter_complex \"$filterComplex\" ")
             append("-map \"[v_out]\" -map \"$currentAudioLabel\" ")
-            append("-c:v h264_mediacodec -b:v ${safeBitrateKbps}k ")
+            if (useHardwareCodec) {
+                append("-c:v h264_mediacodec -b:v ${safeBitrateKbps}k ")
+            } else {
+                append("-c:v libx264 -preset ultrafast -crf 23 -maxrate ${safeBitrateKbps}k -bufsize ${safeBitrateKbps * 2}k ")
+            }
             append("-c:a aac -b:a 160k -ar 48000 ")
             append("-movflags +faststart ")
             append("\"${outputFile.absolutePath}\"")
         }
     }
 
-    private suspend fun executeHardwareCommand(cmd: String): Boolean =
+    private suspend fun executeFFmpegCommand(cmd: String): Boolean =
         suspendCancellableCoroutine { cont ->
             FFmpegKit.executeAsync(cmd) { session ->
                 val ok = ReturnCode.isSuccess(session.returnCode)
                 if (!ok) {
-                    Log.e(TAG, "FFmpeg h264_mediacodec execution failed:\n${session.allLogsAsString}")
+                    Log.e(TAG, "FFmpeg execution failed:\n${session.allLogsAsString}")
                 }
                 if (cont.isActive) cont.resume(ok)
             }

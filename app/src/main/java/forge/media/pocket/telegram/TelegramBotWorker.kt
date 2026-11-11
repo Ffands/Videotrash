@@ -27,22 +27,25 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.forms.ChannelProvider
 import io.ktor.client.request.forms.MultiPartFormDataContent
 import io.ktor.client.request.forms.formData
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.http.ContentType
 import io.ktor.http.Headers
 import io.ktor.http.HttpHeaders
+import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import io.ktor.utils.io.jvm.javaio.toByteReadChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -90,23 +93,25 @@ class TelegramBotWorker(
 
     companion object {
         private const val TAG = "TelegramBotWorker"
+        private const val SUBTITLE_NUDGE_STEP_PX = 120
+
+        private const val BTN_MENU_HUNT = "🔎 Найти видео по теме"
+        private const val BTN_MENU_LINK = "🎬 Собрать по ссылке"
+        private const val BTN_MENU_AUTO = "🤖 Автопилот"
+        private const val BTN_MENU_STATUS = "📊 Статус и Фон"
     }
 
-    private val botToken: String
-        get() = configStore.getTelegramBotToken()
+    private val isPolling = AtomicBoolean(false)
+    private var pollingJob: Job? = null
+    private var lastUpdateOffset: Long = 0L
+
+    private val isAutopilotEnabled = AtomicBoolean(false)
+    private var autopilotJob: Job? = null
+    private var autopilotIntervalMinutes: Long = 60L
+    private var autopilotChatId: Long = configStore.getAllowedChatId()
 
     private val sessions = ConcurrentHashMap<String, InteractiveJobSession>()
     private val huntFilters = ConcurrentHashMap<String, PendingHuntFilterState>()
-
-    private var pollingJob: Job? = null
-    private var autopilotJob: Job? = null
-    private val isAutopilotEnabled = AtomicBoolean(false)
-    @Volatile
-    private var autopilotChatId: Long = 0L
-    @Volatile
-    private var autopilotIntervalMinutes: Long = 60L
-
-    private var lastUpdateId: Long = 0L
 
     private val jsonFormat = Json {
         ignoreUnknownKeys = true
@@ -115,13 +120,13 @@ class TelegramBotWorker(
     }
 
     private val httpClient = HttpClient(OkHttp) {
-        install(ContentNegotiation) {
-            json(jsonFormat)
-        }
         install(HttpTimeout) {
             requestTimeoutMillis = 120_000L
-            connectTimeoutMillis = 20_000L
+            connectTimeoutMillis = 25_000L
             socketTimeoutMillis = 120_000L
+        }
+        install(ContentNegotiation) {
+            json(jsonFormat)
         }
     }
 
@@ -169,53 +174,78 @@ class TelegramBotWorker(
         @SerialName("callback_data") val callbackData: String
     )
 
+    @Serializable
+    private data class ReplyKeyboardMarkup(
+        val keyboard: List<List<KeyboardButton>>,
+        @SerialName("resize_keyboard") val resizeKeyboard: Boolean = true,
+        @SerialName("is_persistent") val isPersistent: Boolean = true
+    )
+
+    @Serializable
+    private data class KeyboardButton(
+        val text: String
+    )
+
+    private val persistentMainMenuKeyboard = ReplyKeyboardMarkup(
+        keyboard = listOf(
+            listOf(KeyboardButton(BTN_MENU_HUNT), KeyboardButton(BTN_MENU_LINK)),
+            listOf(KeyboardButton(BTN_MENU_AUTO), KeyboardButton(BTN_MENU_STATUS))
+        ),
+        resizeKeyboard = true,
+        isPersistent = true
+    )
+
+    private fun baseUrl(): String =
+        "https://api.telegram.org/bot${configStore.getTelegramBotToken()}"
+
+    private fun isChatAuthorized(chatId: Long): Boolean {
+        val allowed = configStore.getAllowedChatId()
+        return allowed == 0L || allowed == chatId
+    }
+
     fun startPolling(scope: CoroutineScope) {
-        if (pollingJob?.isActive == true) return
+        if (configStore.getTelegramBotToken().isBlank()) {
+            Log.w(TAG, "TELEGRAM_BOT_TOKEN is empty; waiting for user input in MainActivity.")
+            return
+        }
+        if (!isPolling.compareAndSet(false, true)) return
+
+        // Start warming up the background clutter pool immediately in the background
+        clutterFilter.triggerBackgroundPoolWarmupIfNeeded()
+
         pollingJob = scope.launch(Dispatchers.IO) {
-            Log.i(TAG, "Started Telegram Long-Polling loop")
-            while (isActive) {
-                val activeToken = botToken
-                if (activeToken.isBlank()) {
-                    delay(5000L)
-                    continue
-                }
+            Log.i(TAG, "Started Telegram Long-Polling controller")
+            while (isActive && isPolling.get()) {
                 try {
-                    val response: TgUpdatesResponse = httpClient.get(
-                        "https://api.telegram.org/bot$activeToken/getUpdates"
-                    ) {
-                        parameter("offset", lastUpdateId + 1)
+                    val response: TgUpdatesResponse = httpClient.get("${baseUrl()}/getUpdates") {
+                        parameter("offset", lastUpdateOffset)
                         parameter("timeout", 25)
                     }.body()
 
                     if (response.ok) {
                         for (update in response.result) {
-                            lastUpdateId = maxOf(lastUpdateId, update.updateId)
-                            handleUpdate(scope, update)
+                            lastUpdateOffset = update.updateId + 1
+                            processUpdate(scope, update)
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Telegram long-poll cycle warning: ${e.message}")
-                    delay(3000L)
+                    Log.w(TAG, "Long-polling network retry in 4s: ${e.message}")
+                    delay(4000L)
                 }
             }
         }
     }
 
     fun stopPolling() {
+        isPolling.set(false)
         pollingJob?.cancel()
-        autopilotJob?.cancel()
         pollingJob = null
+        isAutopilotEnabled.set(false)
+        autopilotJob?.cancel()
         autopilotJob = null
     }
 
-    private fun isChatAuthorized(chatId: Long): Boolean {
-        val allowedRaw = configStore.getAllowedChatId().trim()
-        if (allowedRaw.isEmpty()) return true
-        val allowedLong = allowedRaw.toLongOrNull() ?: return true
-        return chatId == allowedLong
-    }
-
-    private suspend fun handleUpdate(scope: CoroutineScope, update: TgUpdate) {
+    private suspend fun processUpdate(scope: CoroutineScope, update: TgUpdate) {
         val incomingMsg = update.message ?: update.channelPost
         incomingMsg?.let { msg ->
             val chatId = msg.chat.id
@@ -228,47 +258,48 @@ class TelegramBotWorker(
             if (autopilotChatId == 0L) autopilotChatId = chatId
 
             when {
-                text.startsWith("/status") -> {
-                    val poolSize = clutterFilter.listVerifiedPoolClips().size
-                    val subs = topicHunter.listAutopilotSubscriptions()
-                    val svcState = PipelineForegroundService.statusFlow.value
+                // 1. Start / Help / Bottom Menu buttons
+                text == "/start" || text == "/help" || text == "/menu" -> {
+                    sendWelcomeMenu(chatId)
+                }
+
+                text == BTN_MENU_STATUS || text.startsWith("/status") -> {
+                    sendNodeStatusCard(chatId)
+                }
+
+                text == BTN_MENU_HUNT -> {
+                    sendQuickTopicPicker(chatId)
+                }
+
+                text == BTN_MENU_LINK -> {
                     sendMessage(
                         chatId = chatId,
-                        text = "⚡ Pocket Media Forge (Snapdragon ARM64)\n" +
-                            "• Ваш Chat ID: $chatId\n" +
-                            "• Статус: $svcState\n" +
-                            "• Проверенных фонов в пуле (3.3A): $poolSize шт.\n" +
-                            "• Активных сессий: ${sessions.size}\n" +
-                            "• Фоновый Автопилот по тегам: ${if (isAutopilotEnabled.get()) "ВКЛ (каждые $autopilotIntervalMinutes мин)" else "ПАУЗА"} (подписок: ${subs.size})"
+                        text = "🎬 Просто вставь сюда любую ссылку на ролик (YouTube Shorts, YouTube, Reddit, Пикабу, TikTok) — я сразу скачаю его и пришлю 5-секундное превью с кнопками настройки!"
                     )
                 }
 
+                text == BTN_MENU_AUTO || text.startsWith("/autotags") -> {
+                    handleAutotagsCommand(scope, chatId, text)
+                }
+
+                // 2. Direct URL anywhere in the message -> immediately process it!
+                text.contains("http://") || text.contains("https://") ||
+                    text.startsWith("/clip") || text.startsWith("/process") -> {
+                    handleIncomingJobCommand(chatId, text)
+                }
+
+                // 3. Explicit /hunt command
                 text.startsWith("/hunt") -> {
                     handleHuntCommand(chatId, text)
                 }
 
-                text.startsWith("/autotags") -> {
-                    handleAutotagsCommand(scope, chatId, text)
-                }
-
-                text.startsWith("/clip") || text.startsWith("/process") || text.startsWith("http") -> {
-                    handleIncomingJobCommand(chatId, text)
+                // 4. Plain text or hashtags (e.g. "cs2", "#юмор", "магическая битва") -> automatically treat as Tag Search!
+                !text.startsWith("/") -> {
+                    handleHuntCommand(chatId, text)
                 }
 
                 else -> {
-                    sendMessage(
-                        chatId = chatId,
-                        text = "🛠 Команды Pocket Media Forge:\n\n" +
-                            "1️⃣ Поиск видео по твоим тегам и тематикам:\n" +
-                            "• /hunt <теги/тема> — откроет пульт выбора сортировки (Популярное / Новизна / Взлетающее) и периода (24ч / Неделя / Месяц / Всё время)\n\n" +
-                            "2️⃣ Фоновый Автопилот по тегам:\n" +
-                            "• /autotags add <теги> [sort=top|new|hot] [period=day|week|month]\n" +
-                            "• /autotags list — список подписок и пульт Автопилота\n" +
-                            "• /autotags del <номер>\n\n" +
-                            "3️⃣ Сборка по прямой ссылке:\n" +
-                            "• /process <url> [preset=podcast|edit|brainrot|original]\n" +
-                            "• /status"
-                    )
+                    sendWelcomeMenu(chatId)
                 }
             }
         }
@@ -282,16 +313,61 @@ class TelegramBotWorker(
         }
     }
 
+    private suspend fun sendWelcomeMenu(chatId: Long) {
+        sendMessage(
+            chatId = chatId,
+            text = "⚡ Пульт Pocket Media Forge готов!\n\n" +
+                "Никаких сложных команд учить не нужно — работай прямо так:\n\n" +
+                "1️⃣ Хочешь смонтировать конкретное видео?\n" +
+                "👉 Просто кинь сюда ссылку (YouTube Shorts / Клип / Пикабу / Reddit).\n\n" +
+                "2️⃣ Хочешь, чтобы я сам нашёл ролики по теме?\n" +
+                "👉 Просто напиши в чат тему или теги (например: cs2, юмор, стендап, магическая битва) или нажми кнопку «🔎 Найти видео по теме» внизу экрана!"
+        )
+    }
+
+    private suspend fun sendNodeStatusCard(chatId: Long) {
+        val poolSize = clutterFilter.listVerifiedPoolClips().size
+        val subs = topicHunter.listAutopilotSubscriptions()
+        val svcState = PipelineForegroundService.statusFlow.value
+
+        val text = "📊 Статус узла (OnePlus Snapdragon):\n\n" +
+            "• Ваш Chat ID: $chatId\n" +
+            "• Конвейер: $svcState\n" +
+            "• Готовых залипалок в пуле (1080x960): $poolSize шт.\n" +
+            "• Активных задач на сборке: ${sessions.size}\n" +
+            "• Фоновый Автопилот: ${if (isAutopilotEnabled.get()) "🟢 ВКЛ (каждые $autopilotIntervalMinutes мин)" else "⏸ НА ПАУЗЕ"} (тем: ${subs.size})"
+
+        val keyboard = InlineKeyboardMarkup(
+            inlineKeyboard = listOf(
+                listOf(
+                    InlineKeyboardButton("🔄 Докачать залипалки в пул сейчас", "pool_warmup:0")
+                )
+            )
+        )
+        sendMessageWithKeyboard(chatId, text, keyboard)
+    }
+
+    private suspend fun sendQuickTopicPicker(chatId: Long) {
+        val text = "🔎 Напиши в чат любую тему/теги (например: cs2, стендап, аниме эдит, физика) ИЛИ выбери готовую тему кнопкой ниже:"
+        val keyboard = InlineKeyboardMarkup(
+            inlineKeyboard = listOf(
+                listOf(
+                    InlineKeyboardButton("🎮 CS2 / Киберспорт", "quick_hunt:cs2 moments shorts"),
+                    InlineKeyboardButton("😂 Юмор / Стендап", "quick_hunt:стендап юмор нарезка")
+                ),
+                listOf(
+                    InlineKeyboardButton("⚔️ Аниме Эдиты", "quick_hunt:anime edit 4k shorts"),
+                    InlineKeyboardButton("🧪 Залипашки / Физика", "quick_hunt:oddly satisfying physics")
+                )
+            )
+        )
+        sendMessageWithKeyboard(chatId, text, keyboard)
+    }
+
     private suspend fun handleHuntCommand(chatId: Long, rawText: String) {
         val queryRaw = rawText.removePrefix("/hunt").trim()
         if (queryRaw.isBlank()) {
-            sendMessage(
-                chatId,
-                "🔎 Укажи теги или тематику после /hunt.\nПримеры:\n" +
-                    "• /hunt аниме эдит магическая битва\n" +
-                    "• /hunt стендап отношения\n" +
-                    "• /hunt пикабу физика залипашка"
-            )
+            sendQuickTopicPicker(chatId)
             return
         }
 
@@ -329,7 +405,9 @@ class TelegramBotWorker(
             }
         }
 
-        val cleanQuery = tagWords.joinToString(" ").ifBlank { rawQuery }
+        val cleanQuery = tagWords.joinToString(" ").replace("#", "").trim().ifBlank {
+            rawQuery.replace("#", "").trim()
+        }
         return PendingHuntFilterState(
             queryTags = cleanQuery,
             platform = platform,
@@ -345,27 +423,29 @@ class TelegramBotWorker(
         state: PendingHuntFilterState
     ) {
         val text = buildString {
-            append("🎯 Поиск контента по тегам: «").append(state.queryTags).append("»\n\n")
+            append("🎯 Тема для поиска: «").append(state.queryTags).append("»\n\n")
             append("• Площадка: ").append(state.platform.label).append("\n")
             append("• Сортировка: ").append(state.sortOrder.label).append("\n")
             append("• Период: ").append(state.period.label).append("\n")
-            append("• Количество роликов: ").append(state.count).append(" шт.\n\n")
-            append("Настрой фильтры кнопками ниже или сразу жми «🚀 Найти и собрать превью»:")
+            append("• Сколько роликов найти: ").append(state.count).append(" шт.\n\n")
+            append("Жми зелёную кнопку «🚀 Найти и собрать превью» (или переключи фильтры):")
         }
 
         val keyboard = InlineKeyboardMarkup(
             inlineKeyboard = listOf(
                 listOf(
-                    InlineKeyboardButton("🚀 Найти и собрать превью (${state.count} шт.)", "hunt_go:$huntId"),
-                    InlineKeyboardButton("🤖 В Автопилот", "hunt_save_auto:$huntId")
+                    InlineKeyboardButton("🚀 Найти и собрать превью (${state.count} шт.)", "hunt_go:$huntId")
                 ),
                 listOf(
-                    InlineKeyboardButton("Сорт: ${state.sortOrder.label.take(18)}", "hunt_sort:$huntId"),
+                    InlineKeyboardButton("Сорт: ${state.sortOrder.label}", "hunt_sort:$huntId"),
                     InlineKeyboardButton("Период: ${state.period.label}", "hunt_period:$huntId")
                 ),
                 listOf(
                     InlineKeyboardButton("Источник: ${state.platform.label}", "hunt_plat:$huntId"),
                     InlineKeyboardButton("Кол-во: ${state.count} шт.", "hunt_cnt:$huntId")
+                ),
+                listOf(
+                    InlineKeyboardButton("🤖 Добавить эту тему в Автопилот", "hunt_save_auto:$huntId")
                 )
             )
         )
@@ -376,79 +456,85 @@ class TelegramBotWorker(
     private suspend fun executeTagHuntBatch(chatId: Long, state: PendingHuntFilterState) {
         sendMessage(
             chatId,
-            "🔎 Ищу ${state.count} небаянистых видео по теме «${state.queryTags}» (${state.sortOrder.label}, ${state.period.label})..."
+            "🔎 Ищу ${state.count} роликов по теме «${state.queryTags}» (${state.sortOrder.label})..."
         )
 
         enqueueHardwareTask("hunt", "Hunting videos for '${state.queryTags}'") {
-            val candidates = topicHunter.huntByTags(
-                queryTags = state.queryTags,
-                platform = state.platform,
-                sortOrder = state.sortOrder,
-                period = state.period,
-                limitCount = state.count
-            )
+            try {
+                val candidates = topicHunter.huntByTags(
+                    queryTags = state.queryTags,
+                    platform = state.platform,
+                    sortOrder = state.sortOrder,
+                    period = state.period,
+                    limitCount = state.count
+                )
 
-            if (candidates.isEmpty()) {
+                if (candidates.isEmpty()) {
+                    sendMessage(
+                        chatId,
+                        "⚠️ По запросу «${state.queryTags}» не удалось получить список видео. Проверь интернет/VPN на телефоне или попробуй другое слово."
+                    )
+                    return@enqueueHardwareTask
+                }
+
+                val listPreview = candidates.mapIndexed { i, c ->
+                    "${i + 1}) ${c.title.take(55)} (${c.durationSec}с)"
+                }.joinToString("\n")
+
                 sendMessage(
                     chatId,
-                    "⚠️ По запросу «${state.queryTags}» за период «${state.period.label}» новых видео (10–75 сек) не найдено. Попробуй расширить период (За месяц / За всё время)."
+                    "✅ Найдено ${candidates.size} роликов:\n$listPreview\n\n⏳ Начинаю сборку 5-сек превью по очереди..."
                 )
-                return@enqueueHardwareTask
-            }
 
-            sendMessage(
-                chatId,
-                "✅ Найдено ${candidates.size} роликов! Начинаю конвейерную сборку 5-сек превью для каждого..."
-            )
-
-            for (cand in candidates) {
-                try {
-                    ingestAndCreateInteractiveSession(
-                        chatId = chatId,
-                        url = cand.url,
-                        initialConfig = buildDefaultConfigWithSavedAdAssets(),
-                        overrideTitle = cand.title,
-                        overrideAuthor = cand.author
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed candidate ${cand.url}", e)
+                for ((index, cand) in candidates.withIndex()) {
+                    try {
+                        sendMessage(
+                            chatId,
+                            "🎬 [${index + 1}/${candidates.size}] Собираю превью: «${cand.title.take(50)}»..."
+                        )
+                        ingestAndCreateInteractiveSession(
+                            chatId = chatId,
+                            url = cand.url,
+                            initialConfig = null,
+                            overrideTitle = cand.title,
+                            overrideAuthor = cand.author
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed candidate ${cand.url}", e)
+                        sendMessage(
+                            chatId,
+                            "⚠️ Пропущен ролик «${cand.title.take(40)}»: ${e.message?.take(120)}"
+                        )
+                    }
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "Hunt batch error", e)
+                sendMessage(chatId, "❌ Ошибка поиска: ${e.message}")
             }
         }
     }
 
     private suspend fun handleAutotagsCommand(scope: CoroutineScope, chatId: Long, rawText: String) {
-        val arg = rawText.removePrefix("/autotags").trim()
+        val arg = rawText.removePrefix("/autotags").removePrefix(BTN_MENU_AUTO).trim()
         when {
             arg.startsWith("add ") -> {
                 val queryPart = arg.removePrefix("add ").trim()
                 val parsed = parseHuntArguments(queryPart)
-                val updated = topicHunter.addAutopilotSubscription(
-                    AutopilotTagSubscription(
-                        queryTags = parsed.queryTags,
-                        platform = parsed.platform,
-                        sortOrder = parsed.sortOrder,
-                        period = parsed.period
-                    )
+                val sub = AutopilotTagSubscription(
+                    queryTags = parsed.queryTags,
+                    platform = parsed.platform,
+                    sortOrder = parsed.sortOrder,
+                    period = parsed.period
                 )
-                sendAutopilotDashboard(chatId, updated)
+                val all = topicHunter.addAutopilotSubscription(sub)
+                startAutopilotLoopIfNeeded(scope, chatId)
+                sendAutopilotDashboard(chatId, all)
             }
 
             arg.startsWith("del ") -> {
                 val target = arg.removePrefix("del ").trim()
-                val updated = topicHunter.removeAutopilotSubscription(target)
-                sendAutopilotDashboard(chatId, updated)
-            }
-
-            arg == "on" -> {
-                startAutopilotLoopIfNeeded(scope, chatId)
-                sendAutopilotDashboard(chatId, topicHunter.listAutopilotSubscriptions())
-            }
-
-            arg == "off" -> {
-                isAutopilotEnabled.set(false)
-                autopilotJob?.cancel()
-                sendAutopilotDashboard(chatId, topicHunter.listAutopilotSubscriptions())
+                val all = topicHunter.removeAutopilotSubscription(target)
+                sendAutopilotDashboard(chatId, all)
             }
 
             else -> {
@@ -464,25 +550,31 @@ class TelegramBotWorker(
         val statusStr = if (isAutopilotEnabled.get()) "🟢 АКТИВЕН (каждые $autopilotIntervalMinutes мин)" else "⏸ НА ПАУЗЕ"
         val sb = StringBuilder("🤖 Фоновый Автопилот по тегам: $statusStr\n\n")
         if (subs.isEmpty()) {
-            sb.append("Список тегов пуст. Добавь через:\n/autotags add аниме эдит sort=top period=week")
+            sb.append("Список подписок пока пуст.\nПросто напиши любую тему в чат (например: cs2 или юмор) и нажми кнопку «🤖 Добавить эту тему в Автопилот»!")
         } else {
             subs.forEachIndexed { idx, s ->
-                sb.append("${idx + 1}. «${s.queryTags}» [${s.platform.name} | ${s.sortOrder.name} | ${s.period.label}]\n")
+                sb.append("${idx + 1}. «${s.queryTags}» [${s.platform.label} | ${s.sortOrder.label}]\n")
             }
         }
 
-        val keyboard = InlineKeyboardMarkup(
-            inlineKeyboard = listOf(
-                listOf(
-                    InlineKeyboardButton(
-                        if (isAutopilotEnabled.get()) "⏸ Поставить Автопилот на паузу" else "▶️ Включить Автопилот",
-                        "auto_toggle:0"
-                    ),
-                    InlineKeyboardButton("⚡ Проверить все теги сейчас", "auto_run_now:0")
-                )
+        val rows = mutableListOf(
+            listOf(
+                InlineKeyboardButton(
+                    if (isAutopilotEnabled.get()) "⏸ Поставить на паузу" else "▶️ Включить Автопилот",
+                    "auto_toggle:0"
+                ),
+                InlineKeyboardButton("⚡ Запустить проверку сейчас", "auto_run_now:0")
             )
         )
-        sendMessageWithKeyboard(chatId, sb.toString(), keyboard)
+        if (subs.isNotEmpty()) {
+            rows.add(
+                listOf(
+                    InlineKeyboardButton("🗑 Очистить последнюю тему (#${subs.size})", "auto_del:${subs.size}")
+                )
+            )
+        }
+
+        sendMessageWithKeyboard(chatId, sb.toString(), InlineKeyboardMarkup(rows))
     }
 
     private fun startAutopilotLoopIfNeeded(scope: CoroutineScope, chatId: Long) {
@@ -504,21 +596,25 @@ class TelegramBotWorker(
 
         for (sub in subs) {
             enqueueHardwareTask("auto", "Autopilot hunting '${sub.queryTags}'") {
-                val found = topicHunter.huntByTags(
-                    queryTags = sub.queryTags,
-                    platform = sub.platform,
-                    sortOrder = sub.sortOrder,
-                    period = sub.period,
-                    limitCount = 1
-                )
-                for (cand in found) {
-                    ingestAndCreateInteractiveSession(
-                        chatId = chatId,
-                        url = cand.url,
-                        initialConfig = buildDefaultConfigWithSavedAdAssets(),
-                        overrideTitle = cand.title,
-                        overrideAuthor = cand.author
+                try {
+                    val found = topicHunter.huntByTags(
+                        queryTags = sub.queryTags,
+                        platform = sub.platform,
+                        sortOrder = sub.sortOrder,
+                        period = sub.period,
+                        limitCount = 1
                     )
+                    for (cand in found) {
+                        ingestAndCreateInteractiveSession(
+                            chatId = chatId,
+                            url = cand.url,
+                            initialConfig = null,
+                            overrideTitle = cand.title,
+                            overrideAuthor = cand.author
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Autopilot sweep failed for ${sub.queryTags}", e)
                 }
             }
         }
@@ -528,51 +624,73 @@ class TelegramBotWorker(
         val tokens = rawCommand.split(Regex("""\s+"""))
         val url = tokens.firstOrNull { it.startsWith("http://") || it.startsWith("https://") }
         if (url == null) {
-            sendMessage(chatId, "❌ Не найдена ссылка. Используй /process <url> или /hunt <теги>.")
+            sendMessage(chatId, "❌ Не найдена ссылка. Просто вставь ссылку https://... или напиши тему для поиска!")
             return
         }
 
-        val initialConfig = parseCommandFlagsToConfig(tokens)
+        val hasExplicitFlags = tokens.size > 1 && rawCommand.startsWith("/")
+        val initialConfig = if (hasExplicitFlags) parseCommandFlagsToConfig(tokens) else null
         val jobId = UUID.randomUUID().toString().take(6)
 
         sendMessage(
             chatId = chatId,
-            text = "⏳ Задача #$jobId в очереди Snapdragon MediaCodec.\n" +
-                "Качаю исходник, проверяю фон (3.3A), центрирую лицо (ML Kit) и собираю 5-сек превью..."
+            text = "⏳ Задача #$jobId принята! Начинаю скачивание и сборку 5-сек превью..."
         )
 
         enqueueHardwareTask(jobId, "Ingesting & building 5s preview") {
-            ingestAndCreateInteractiveSession(
-                chatId = chatId,
-                url = url,
-                initialConfig = initialConfig,
-                fixedJobId = jobId
-            )
+            try {
+                ingestAndCreateInteractiveSession(
+                    chatId = chatId,
+                    url = url,
+                    initialConfig = initialConfig,
+                    fixedJobId = jobId
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Job #$jobId failed", e)
+                sendMessage(
+                    chatId = chatId,
+                    text = "❌ Задача #$jobId завершилась с ошибкой:\n${e.message ?: "Неизвестная ошибка при обработке видео"}\n\n" +
+                        "💡 Если это YouTube, убедись, что на телефоне включён VPN."
+                )
+            }
         }
     }
 
     private suspend fun ingestAndCreateInteractiveSession(
         chatId: Long,
         url: String,
-        initialConfig: ModularRenderConfig,
+        initialConfig: ModularRenderConfig?,
         fixedJobId: String? = null,
         overrideTitle: String? = null,
         overrideAuthor: String? = null
     ) {
         val jobId = fixedJobId ?: UUID.randomUUID().toString().take(6)
+
+        sendMessage(chatId, "📥 [#$jobId • Шаг 1/4] Скачиваю исходное видео...")
         val bundle = clutterFilter.downloadMediaWithMetadata(url, maxDurationSec = 75)
         val durationSec = hardwareEngine.probeDurationSeconds(bundle.videoFile)
-        val clutterFile = clutterFilter.buildShuffledClutterReel(durationSec)
+
+        // Smart auto-layout: if input is already vertical 9:16 (like a YouTube Short), default to FULLSCREEN_EDIT
+        // so it isn't squashed; if input is horizontal 16:9, default to SPLIT_VSTACK (50/50 split)!
+        val isVertical = faceHelper.isVerticalSource(bundle.videoFile)
+        val resolvedConfig = initialConfig ?: buildDefaultConfigWithSavedAdAssets(isVerticalInput = isVertical)
+
+        sendMessage(chatId, "🎯 [#$jobId • Шаг 2/4] Анализирую кадр (ML Kit) и готовлю нижний фон...")
+        val clutterFile = clutterFilter.buildShuffledClutterReel(
+            targetDurationSec = durationSec,
+            fallbackPrimaryVideo = bundle.videoFile
+        )
 
         val framingPlan = faceHelper.computeFramingPlan(
             videoFile = bundle.videoFile,
-            enableSmartFaceCrop = initialConfig.enableSmartFaceCrop
+            enableSmartFaceCrop = resolvedConfig.enableSmartFaceCrop
         )
 
+        sendMessage(chatId, "💬 [#$jobId • Шаг 3/4] Готовлю субтитры...")
         val (subResult, words) = subtitleTransformer.prepareAssSubtitles(
             sourceUrl = url,
             localVideoFile = bundle.videoFile,
-            config = initialConfig.subtitleLayer,
+            config = resolvedConfig.subtitleLayer,
             framingPlan = framingPlan
         )
 
@@ -589,10 +707,11 @@ class TelegramBotWorker(
             cachedWords = words,
             latestAssFile = subResult.assFile,
             transcriptText = subResult.plainTranscriptText,
-            config = initialConfig
+            config = resolvedConfig
         )
         sessions[jobId] = session
 
+        sendMessage(chatId, "⚡ [#$jobId • Шаг 4/4] Рендерю 5-сек превью и отправляю в чат...")
         renderAndSendPreviewWithControls(session)
     }
 
@@ -610,24 +729,24 @@ class TelegramBotWorker(
         val caption = buildString {
             append("🎬 Превью #").append(session.jobId).append(" (5 сек)\n")
             if (session.originalTitle.isNotBlank()) {
-                append("📌 Исходник: ").append(session.originalTitle.take(60))
+                append("📌 ").append(session.originalTitle.take(60))
                 if (session.originalAuthor.isNotBlank()) {
                     append(" (").append(session.originalAuthor).append(")")
                 }
                 append("\n")
             }
-            append("• Режим: ").append(session.config.layoutLayer.label).append("\n")
-            append("• Кроп лица: ").append(session.framingPlan.summary).append("\n")
+            append("• Формат: ").append(session.config.layoutLayer.label).append("\n")
+            append("• Центровка: ").append(session.framingPlan.summary).append("\n")
             append("• Субтитры: ").append(
                 if (session.config.subtitleLayer.enabled) {
-                    "ВКЛ (${session.config.subtitleLayer.placementZone.label}, Y=$resolvedSubY)"
+                    "ВКЛ (выс. Y=$resolvedSubY)"
                 } else {
                     "ВЫКЛ"
                 }
             ).append("\n")
-            append("• Обход Content ID (Зум+Питч+Паузы): ").append(if (session.config.dspLayer.enabled) "ВКЛ" else "ВЫКЛ").append("\n")
-            append("• Реклама: ").append(session.config.adLayer.mode).append("\n")
-            append("• AI-Описание (3 названия + тайтл): ").append(if (session.config.enableAiMetadataGeneration) "ВКЛ" else "ВЫКЛ")
+            append("• Защита от Content ID: ").append(if (session.config.dspLayer.enabled) "ВКЛ" else "ВЫКЛ").append("\n")
+            append("• Реклама: ").append(session.config.adLayer.mode).append("\n\n")
+            append("👇 Настраивай слои кнопками ниже (превью пересоберётся) или жми «✅ Одобрить»:")
         }
 
         val keyboard = buildInteractiveLayerKeyboard(session)
@@ -643,46 +762,56 @@ class TelegramBotWorker(
     private fun buildInteractiveLayerKeyboard(session: InteractiveJobSession): InlineKeyboardMarkup {
         val id = session.jobId
         val cfg = session.config
-        val (_, subY) = cfg.subtitleLayer.resolveCoordinates(session.framingPlan)
 
-        val subToggleLabel = if (cfg.subtitleLayer.enabled) "💬 Сабы: ВКЛ (Y=$subY)" else "💬 Сабы: ВЫКЛ"
-        val subStyleLabel = if (cfg.subtitleLayer.densityMode == SubtitleDensityMode.PUNCH_3_TO_4_WORDS) {
-            "🔤 Стиль: Панч 3-4 сл."
-        } else {
-            "🔤 Стиль: Строка 6-8 сл."
+        val layoutBtnText = "📐 Режим: ${cfg.layoutLayer.label.take(20)}"
+        val faceCropBtnText = if (cfg.enableSmartFaceCrop) "🎯 Лицо ML: ВКЛ" else "🎯 Лицо ML: ВЫКЛ"
+
+        val subsToggleText = if (cfg.subtitleLayer.enabled) "💬 Сабы: ВКЛ" else "💬 Сабы: ВЫКЛ"
+        val subsDensityText = when (cfg.subtitleLayer.densityMode) {
+            SubtitleDensityMode.PUNCH_3_TO_4_WORDS -> "Стиль: 3-4 слова"
+            SubtitleDensityMode.CLASSIC_6_TO_8_WORDS -> "Стиль: 6-8 слов"
         }
-        val cropLabel = if (cfg.enableSmartFaceCrop) "👤 Кроп: Авто ML" else "👤 Кроп: ВЫКЛ (16:9)"
-        val layoutLabel = "📐 Режим: ${cfg.layoutLayer.name.take(12)}"
-        val dspLabel = if (cfg.dspLayer.enabled) "🛡 Анти-ID: ВКЛ" else "🛡 Анти-ID: ВЫКЛ"
-        val adLabel = "📢 Реклама: ${cfg.adLayer.mode.name.take(10)}"
-        val aiMetaLabel = if (cfg.enableAiMetadataGeneration) "📝 AI (3 назв.): ВКЛ" else "📝 AI: ВЫКЛ"
+
+        val subsZoneText = "📍 Поз: ${cfg.subtitleLayer.placementZone.label}"
+        val dspText = if (cfg.dspLayer.enabled) "🛡 Анти-Детект: ВКЛ" else "🛡 Анти-Детект: ВЫКЛ"
+
+        val adText = when (cfg.adLayer.mode) {
+            AdInsertionMode.NONE -> "💰 Реклама: ВЫКЛ"
+            AdInsertionMode.BANNER_OVERLAY -> "💰 Реклама: БАННЕР"
+            AdInsertionMode.MIDROLL_SPLICE -> "💰 Реклама: ВРЕЗКА 3с"
+            AdInsertionMode.MIDROLL_PIP_OVERLAY -> "💰 Реклама: PiP 3с"
+            AdInsertionMode.PINNED_COMMENT_ONLY -> "💰 Реклама: В ЗАКРЕП"
+        }
+
+        val aiMetaText = if (cfg.enableAiMetadataGeneration) "🤖 AI-Описание: ВКЛ" else "🤖 AI-Описание: ВЫКЛ"
 
         return InlineKeyboardMarkup(
             inlineKeyboard = listOf(
                 listOf(
-                    InlineKeyboardButton("✅ Одобрить (MP4 без сжатия)", "approve:$id"),
-                    InlineKeyboardButton("📦 Скинуть все исходники", "rawpack:$id")
+                    InlineKeyboardButton(layoutBtnText, "layout:$id"),
+                    InlineKeyboardButton(faceCropBtnText, "face:$id")
                 ),
                 listOf(
-                    InlineKeyboardButton(subToggleLabel, "toggle_sub:$id"),
-                    InlineKeyboardButton(subStyleLabel, "cycle_sub_style:$id")
+                    InlineKeyboardButton(subsToggleText, "sub_on:$id"),
+                    InlineKeyboardButton(subsDensityText, "sub_den:$id")
                 ),
                 listOf(
-                    InlineKeyboardButton("⬆️ Сабы выше (-120px)", "sub_y_up:$id"),
-                    InlineKeyboardButton("⬇️ Сабы ниже (+120px)", "sub_y_down:$id"),
-                    InlineKeyboardButton("📍 Зона", "cycle_sub_zone:$id")
+                    InlineKeyboardButton(subsZoneText, "sub_zone:$id"),
+                    InlineKeyboardButton("⬆️ Сабы Выше", "sub_up:$id"),
+                    InlineKeyboardButton("⬇️ Сабы Ниже", "sub_dn:$id")
                 ),
                 listOf(
-                    InlineKeyboardButton(cropLabel, "toggle_crop:$id"),
-                    InlineKeyboardButton(layoutLabel, "cycle_layout:$id")
+                    InlineKeyboardButton(dspText, "dsp:$id"),
+                    InlineKeyboardButton(adText, "ad_mode:$id")
                 ),
                 listOf(
-                    InlineKeyboardButton(dspLabel, "toggle_dsp:$id"),
-                    InlineKeyboardButton(adLabel, "cycle_ad:$id"),
-                    InlineKeyboardButton(aiMetaLabel, "toggle_ai:$id")
+                    InlineKeyboardButton(aiMetaText, "ai_meta:$id")
                 ),
                 listOf(
-                    InlineKeyboardButton("🔄 Обновить 5с превью", "repreview:$id"),
+                    InlineKeyboardButton("✅ Одобрить (Готовый MP4)", "approve:$id"),
+                    InlineKeyboardButton("📦 Скинуть исходники", "raw_pack:$id")
+                ),
+                listOf(
                     InlineKeyboardButton("🗑 В мусор", "reject:$id")
                 )
             )
@@ -694,47 +823,66 @@ class TelegramBotWorker(
         chatId: Long,
         data: String
     ) {
-        val parts = data.split(":")
-        if (parts.size != 2) return
+        val parts = data.split(":", limit = 2)
+        if (parts.size < 2) return
         val action = parts[0]
         val targetId = parts[1]
 
+        if (action == "pool_warmup") {
+            clutterFilter.triggerBackgroundPoolWarmupIfNeeded()
+            sendMessage(chatId, "🔄 Запущена фоновая докачка и проверка залипалок (1080x960) в локальный пул!")
+            return
+        }
+
+        if (action == "quick_hunt") {
+            handleHuntCommand(chatId, targetId)
+            return
+        }
+
         if (action.startsWith("hunt_")) {
-            val state = huntFilters[targetId] ?: return
+            val filterState = huntFilters[targetId]
+            if (filterState == null) {
+                sendMessage(chatId, "⚠️ Сессия поиска истекла. Напиши тему заново.")
+                return
+            }
             when (action) {
                 "hunt_sort" -> {
-                    val orders = ContentSortOrder.entries
-                    state.sortOrder = orders[(state.sortOrder.ordinal + 1) % orders.size]
-                    sendHuntConfiguratorMessage(chatId, targetId, state)
+                    val values = ContentSortOrder.entries
+                    filterState.sortOrder = values[(filterState.sortOrder.ordinal + 1) % values.size]
+                    sendHuntConfiguratorMessage(chatId, targetId, filterState)
                 }
                 "hunt_period" -> {
-                    val periods = SearchTimePeriod.entries
-                    state.period = periods[(state.period.ordinal + 1) % periods.size]
-                    sendHuntConfiguratorMessage(chatId, targetId, state)
+                    val values = SearchTimePeriod.entries
+                    filterState.period = values[(filterState.period.ordinal + 1) % values.size]
+                    sendHuntConfiguratorMessage(chatId, targetId, filterState)
                 }
                 "hunt_plat" -> {
-                    val plats = HuntPlatform.entries
-                    state.platform = plats[(state.platform.ordinal + 1) % plats.size]
-                    sendHuntConfiguratorMessage(chatId, targetId, state)
+                    val values = HuntPlatform.entries
+                    filterState.platform = values[(filterState.platform.ordinal + 1) % values.size]
+                    sendHuntConfiguratorMessage(chatId, targetId, filterState)
                 }
                 "hunt_cnt" -> {
-                    state.count = if (state.count >= 5) 1 else state.count + 2
-                    sendHuntConfiguratorMessage(chatId, targetId, state)
+                    filterState.count = when (filterState.count) {
+                        1 -> 3
+                        3 -> 5
+                        else -> 1
+                    }
+                    sendHuntConfiguratorMessage(chatId, targetId, filterState)
                 }
                 "hunt_save_auto" -> {
-                    val subs = topicHunter.addAutopilotSubscription(
-                        AutopilotTagSubscription(
-                            queryTags = state.queryTags,
-                            platform = state.platform,
-                            sortOrder = state.sortOrder,
-                            period = state.period
-                        )
+                    val sub = AutopilotTagSubscription(
+                        queryTags = filterState.queryTags,
+                        platform = filterState.platform,
+                        sortOrder = filterState.sortOrder,
+                        period = filterState.period
                     )
-                    sendAutopilotDashboard(chatId, subs)
+                    val all = topicHunter.addAutopilotSubscription(sub)
+                    startAutopilotLoopIfNeeded(scope, chatId)
+                    sendAutopilotDashboard(chatId, all)
                 }
                 "hunt_go" -> {
                     huntFilters.remove(targetId)
-                    executeTagHuntBatch(chatId, state)
+                    executeTagHuntBatch(chatId, filterState)
                 }
             }
             return
@@ -744,162 +892,207 @@ class TelegramBotWorker(
             if (isAutopilotEnabled.get()) {
                 isAutopilotEnabled.set(false)
                 autopilotJob?.cancel()
+                autopilotJob = null
             } else {
                 startAutopilotLoopIfNeeded(scope, chatId)
             }
             sendAutopilotDashboard(chatId, topicHunter.listAutopilotSubscriptions())
             return
         }
+
         if (action == "auto_run_now") {
             sendMessage(chatId, "⚡ Запускаю внеочередной обход всех подписок Автопилота...")
             runSingleAutopilotSweep(chatId)
             return
         }
 
+        if (action == "auto_del") {
+            val all = topicHunter.removeAutopilotSubscription(targetId)
+            sendAutopilotDashboard(chatId, all)
+            return
+        }
+
         val session = sessions[targetId]
         if (session == null) {
-            sendMessage(chatId, "⚠️ Сессия #$targetId уже закрыта или очищена.")
+            sendMessage(chatId, "⚠️ Сессия #$targetId уже завершена или удалена.")
             return
         }
 
         when (action) {
-            "toggle_sub" -> {
-                val cur = session.config.subtitleLayer
-                session.config = session.config.copy(
-                    subtitleLayer = cur.copy(enabled = !cur.enabled)
-                )
-                regenerateAssForSession(session)
-                sendMessage(chatId, "💬 Субтитры: ${if (session.config.subtitleLayer.enabled) "ВКЛ" else "ВЫКЛ"}")
+            "reject" -> {
+                cleanupSession(targetId)
+                sendMessage(chatId, "🗑 Задача #$targetId удалена, временные файлы очищены.")
             }
 
-            "cycle_sub_style" -> {
-                val cur = session.config.subtitleLayer
-                val nextMode = if (cur.densityMode == SubtitleDensityMode.PUNCH_3_TO_4_WORDS) {
-                    SubtitleDensityMode.CLASSIC_6_TO_8_WORDS
-                } else {
-                    SubtitleDensityMode.PUNCH_3_TO_4_WORDS
-                }
-                session.config = session.config.copy(
-                    subtitleLayer = cur.copy(densityMode = nextMode)
+            "approve" -> {
+                sendMessage(
+                    chatId,
+                    "🚀 Одобрено! Собираю полный ролик #$targetId в максимальном качестве + генерирую 3 названия и описание..."
                 )
-                regenerateAssForSession(session)
-                sendMessage(chatId, "🔤 Стиль субтитров: $nextMode")
-            }
-
-            "sub_y_up" -> {
-                val cur = session.config.subtitleLayer
-                val (_, currentY) = cur.resolveCoordinates(session.framingPlan)
-                val newY = (currentY - 120).coerceIn(140, 1780)
-                session.config = session.config.copy(
-                    subtitleLayer = cur.copy(
-                        placementZone = SubtitlePlacementZone.CUSTOM_XY,
-                        customY = newY
-                    )
-                )
-                regenerateAssForSession(session)
-                sendMessage(chatId, "⬆️ Блок субтитров сдвинут вверх: Y=$newY px")
-            }
-
-            "sub_y_down" -> {
-                val cur = session.config.subtitleLayer
-                val (_, currentY) = cur.resolveCoordinates(session.framingPlan)
-                val newY = (currentY + 120).coerceIn(140, 1780)
-                session.config = session.config.copy(
-                    subtitleLayer = cur.copy(
-                        placementZone = SubtitlePlacementZone.CUSTOM_XY,
-                        customY = newY
-                    )
-                )
-                regenerateAssForSession(session)
-                sendMessage(chatId, "⬇️ Блок субтитров сдвинут вниз: Y=$newY px")
-            }
-
-            "cycle_sub_zone" -> {
-                val zones = SubtitlePlacementZone.entries
-                val curZone = session.config.subtitleLayer.placementZone
-                val nextZone = zones[(curZone.ordinal + 1) % zones.size]
-                session.config = session.config.copy(
-                    subtitleLayer = session.config.subtitleLayer.copy(placementZone = nextZone)
-                )
-                regenerateAssForSession(session)
-                sendMessage(chatId, "📍 Зона субтитров: ${nextZone.label}")
-            }
-
-            "toggle_crop" -> {
-                val nextCrop = !session.config.enableSmartFaceCrop
-                session.config = session.config.copy(enableSmartFaceCrop = nextCrop)
-                enqueueHardwareTask(targetId, "Recomputing face crop") {
-                    session.framingPlan = faceHelper.computeFramingPlan(
-                        videoFile = session.primaryVideoFile,
-                        enableSmartFaceCrop = nextCrop
-                    )
-                    regenerateAssForSession(session)
-                    sendMessage(chatId, "👤 Кроп лица: ${session.framingPlan.summary}")
+                enqueueHardwareTask(targetId, "Rendering Final Master MP4") {
+                    try {
+                        renderFinalAndDeliver(session)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Final render failed for #$targetId", e)
+                        sendMessage(chatId, "❌ Ошибка финального рендера #$targetId: ${e.message}")
+                    }
                 }
             }
 
-            "cycle_layout" -> {
-                val layouts = VideoLayoutLayer.entries
-                val nextLayout = layouts[(session.config.layoutLayer.ordinal + 1) % layouts.size]
+            "raw_pack" -> {
+                sendMessage(
+                    chatId,
+                    "📦 Готовлю пакет исходников #$targetId (чистое видео, фон 1080x960, .ASS субтитры и .M4A звук)..."
+                )
+                enqueueHardwareTask(targetId, "Exporting Raw Source Pack") {
+                    try {
+                        exportAndDeliverRawSourcePack(session)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Raw pack failed for #$targetId", e)
+                        sendMessage(chatId, "❌ Ошибка выгрузки исходников #$targetId: ${e.message}")
+                    }
+                }
+            }
+
+            "layout" -> {
+                val values = VideoLayoutLayer.entries
+                val nextLayout = values[(session.config.layoutLayer.ordinal + 1) % values.size]
                 session.config = session.config.copy(layoutLayer = nextLayout)
-                sendMessage(chatId, "📐 Режим сборки: ${nextLayout.label}")
+                rebuildPreviewAsync(session, "Переключаю режим на ${nextLayout.label}")
             }
 
-            "toggle_dsp" -> {
+            "face" -> {
+                val nextFace = !session.config.enableSmartFaceCrop
+                session.config = session.config.copy(enableSmartFaceCrop = nextFace)
+                enqueueHardwareTask(targetId, "Recomputing face crop & 5s preview") {
+                    try {
+                        session.framingPlan = faceHelper.computeFramingPlan(
+                            videoFile = session.primaryVideoFile,
+                            enableSmartFaceCrop = nextFace
+                        )
+                        regenerateAssForSession(session)
+                        renderAndSendPreviewWithControls(session)
+                    } catch (e: Exception) {
+                        sendMessage(chatId, "❌ Ошибка пересборки превью: ${e.message}")
+                    }
+                }
+            }
+
+            "sub_on" -> {
+                val nextSub = !session.config.subtitleLayer.enabled
+                session.config = session.config.copy(
+                    subtitleLayer = session.config.subtitleLayer.copy(enabled = nextSub)
+                )
+                rebuildPreviewAsync(session, "Переключаю субтитры")
+            }
+
+            "sub_den" -> {
+                val nextDen = when (session.config.subtitleLayer.densityMode) {
+                    SubtitleDensityMode.PUNCH_3_TO_4_WORDS -> SubtitleDensityMode.CLASSIC_6_TO_8_WORDS
+                    SubtitleDensityMode.CLASSIC_6_TO_8_WORDS -> SubtitleDensityMode.PUNCH_3_TO_4_WORDS
+                }
+                session.config = session.config.copy(
+                    subtitleLayer = session.config.subtitleLayer.copy(densityMode = nextDen)
+                )
+                rebuildPreviewWithAssRegenAsync(session, "Меняю плотность субтитров")
+            }
+
+            "sub_zone" -> {
+                val zones = listOf(
+                    SubtitlePlacementZone.ADAPTIVE_AUTO,
+                    SubtitlePlacementZone.TOP_SAFE,
+                    SubtitlePlacementZone.UPPER_THIRD,
+                    SubtitlePlacementZone.CENTER_SEAM,
+                    SubtitlePlacementZone.LOWER_BOX_MID,
+                    SubtitlePlacementZone.BOTTOM_SAFE
+                )
+                val currentIdx = zones.indexOf(session.config.subtitleLayer.placementZone).coerceAtLeast(0)
+                val nextZone = zones[(currentIdx + 1) % zones.size]
+                session.config = session.config.copy(
+                    subtitleLayer = session.config.subtitleLayer.copy(
+                        placementZone = nextZone,
+                        customY = nextZone.defaultY
+                    )
+                )
+                rebuildPreviewWithAssRegenAsync(session, "Двигаю зону субтитров: ${nextZone.label}")
+            }
+
+            "sub_up" -> {
+                val (_, curY) = session.config.subtitleLayer.resolveCoordinates(session.framingPlan)
+                val newY = (curY - SUBTITLE_NUDGE_STEP_PX).coerceIn(140, 1780)
+                session.config = session.config.copy(
+                    subtitleLayer = session.config.subtitleLayer.copy(
+                        placementZone = SubtitlePlacementZone.CUSTOM_XY,
+                        customY = newY
+                    )
+                )
+                rebuildPreviewWithAssRegenAsync(session, "Сдвигаю субтитры выше (Y=$newY)")
+            }
+
+            "sub_dn" -> {
+                val (_, curY) = session.config.subtitleLayer.resolveCoordinates(session.framingPlan)
+                val newY = (curY + SUBTITLE_NUDGE_STEP_PX).coerceIn(140, 1780)
+                session.config = session.config.copy(
+                    subtitleLayer = session.config.subtitleLayer.copy(
+                        placementZone = SubtitlePlacementZone.CUSTOM_XY,
+                        customY = newY
+                    )
+                )
+                rebuildPreviewWithAssRegenAsync(session, "Сдвигаю субтитры ниже (Y=$newY)")
+            }
+
+            "dsp" -> {
                 val nextDsp = !session.config.dspLayer.enabled
                 session.config = session.config.copy(
                     dspLayer = session.config.dspLayer.copy(enabled = nextDsp)
                 )
-                sendMessage(chatId, "🛡 Обход Content ID (Зум+Питч+Паузы): ${if (nextDsp) "ВКЛ" else "ВЫКЛ"}")
+                rebuildPreviewAsync(session, "Переключаю защиту от Content ID")
             }
 
-            "cycle_ad" -> {
+            "ad_mode" -> {
                 val modes = AdInsertionMode.entries
-                val nextAd = modes[(session.config.adLayer.mode.ordinal + 1) % modes.size]
+                val nextMode = modes[(session.config.adLayer.mode.ordinal + 1) % modes.size]
                 session.config = session.config.copy(
-                    adLayer = session.config.adLayer.copy(mode = nextAd)
+                    adLayer = session.config.adLayer.copy(
+                        mode = nextMode,
+                        bannerText = configStore.getDefaultBannerText(),
+                        promoLinkForComment = configStore.getDefaultPromoUrl(),
+                        midrollClipFile = configStore.getSavedMidrollFile()
+                    )
                 )
-                sendMessage(chatId, "📢 Режим рекламы: $nextAd")
+                rebuildPreviewAsync(session, "Переключаю режим рекламы: $nextMode")
             }
 
-            "toggle_ai" -> {
+            "ai_meta" -> {
                 val nextAi = !session.config.enableAiMetadataGeneration
                 session.config = session.config.copy(enableAiMetadataGeneration = nextAi)
-                sendMessage(chatId, "📝 Генерация AI-описания (3 названия + тайтл): ${if (nextAi) "ВКЛ" else "ВЫКЛ"}")
-            }
-
-            "repreview" -> {
-                sendMessage(chatId, "🔄 Пересобираю 5-сек превью для #$targetId...")
-                enqueueHardwareTask(targetId, "Re-rendering 5s preview") {
-                    renderAndSendPreviewWithControls(session)
-                }
-            }
-
-            "approve" -> {
-                sendMessage(chatId, "🚀 Запущен полный рендер #$targetId на Snapdragon (h264_mediacodec)...")
-                enqueueHardwareTask(targetId, "Full hardware render") {
-                    executeFullRenderAndDeliver(session)
-                }
-            }
-
-            "rawpack" -> {
-                sendMessage(
-                    chatId,
-                    "📦 Выгружаю все раздельные исходники по задаче #$targetId (в память телефона Downloads и сюда в чат)..."
-                )
-                enqueueHardwareTask(targetId, "Exporting raw source pack") {
-                    exportAndDeliverRawSourcePack(session)
-                }
-            }
-
-            "reject" -> {
-                cleanupSession(targetId)
-                sendMessage(chatId, "🗑 Задача #$targetId отправлена в мусор, кэш очищен.")
+                rebuildPreviewAsync(session, "Переключаю генерацию AI-описания")
             }
         }
     }
 
-    private suspend fun executeFullRenderAndDeliver(session: InteractiveJobSession) {
+    private fun rebuildPreviewAsync(session: InteractiveJobSession, stageLabel: String) {
+        enqueueHardwareTask(session.jobId, stageLabel) {
+            try {
+                renderAndSendPreviewWithControls(session)
+            } catch (e: Exception) {
+                sendMessage(session.chatId, "❌ Ошибка пересборки превью: ${e.message}")
+            }
+        }
+    }
+
+    private fun rebuildPreviewWithAssRegenAsync(session: InteractiveJobSession, stageLabel: String) {
+        enqueueHardwareTask(session.jobId, stageLabel) {
+            try {
+                regenerateAssForSession(session)
+                renderAndSendPreviewWithControls(session)
+            } catch (e: Exception) {
+                sendMessage(session.chatId, "❌ Ошибка обновления субтитров: ${e.message}")
+            }
+        }
+    }
+
+    private suspend fun renderFinalAndDeliver(session: InteractiveJobSession) {
         val finalMp4 = hardwareEngine.renderPipeline(
             primaryVideoFile = session.primaryVideoFile,
             clutterReelFile = session.clutterReelFile,
@@ -1001,55 +1194,86 @@ class TelegramBotWorker(
         session.latestAssFile = subRes.assFile
     }
 
-    private fun buildDefaultConfigWithSavedAdAssets(): ModularRenderConfig {
-        val bannerText = configStore.getCustomBannerText()
-        val promoUrl = configStore.getSponsorPromoUrl()
-        val midrollFile = configStore.getMidrollVideoFile()
-        return ModularRenderConfig(
+    private fun buildDefaultConfigWithSavedAdAssets(isVerticalInput: Boolean = false): ModularRenderConfig {
+        val base = if (isVerticalInput) {
+            // If source is already a 9:16 vertical Short, keep it full-screen by default (user can switch to Split 50/50 in 1 tap)
+            ModularRenderConfig.presetFullscreenEdit().copy(
+                subtitleLayer = forge.media.pocket.subtitles.SubtitleLayerConfig(enabled = true)
+            )
+        } else {
+            ModularRenderConfig.presetPodcastSplit()
+        }
+        return base.copy(
             adLayer = AdLayerConfig(
                 mode = AdInsertionMode.NONE,
-                bannerText = bannerText,
-                midrollClipFile = midrollFile,
-                sponsorTrackingUrl = promoUrl
+                bannerText = configStore.getDefaultBannerText(),
+                promoLinkForComment = configStore.getDefaultPromoUrl(),
+                midrollClipFile = configStore.getSavedMidrollFile()
             )
         )
     }
 
     private fun parseCommandFlagsToConfig(tokens: List<String>): ModularRenderConfig {
-        var config = buildDefaultConfigWithSavedAdAssets()
+        var config = buildDefaultConfigWithSavedAdAssets(isVerticalInput = false)
+
         for (token in tokens) {
             val lower = token.lowercase()
             when {
-                lower == "preset=edit" || lower == "layout=full" ->
-                    config = config.copy(layoutLayer = VideoLayoutLayer.FULLSCREEN_EDIT)
-                lower == "preset=brainrot" ->
-                    config = config.copy(layoutLayer = VideoLayoutLayer.BRAINROT_VOICEOVER)
-                lower == "preset=original" ->
-                    config = config.copy(layoutLayer = VideoLayoutLayer.DISTORTED_ORIGINAL)
-                lower == "ad=banner" ->
-                    config = config.copy(adLayer = config.adLayer.copy(mode = AdInsertionMode.BANNER_OVERLAY))
-                lower == "ad=midroll" ->
-                    config = config.copy(adLayer = config.adLayer.copy(mode = AdInsertionMode.MIDROLL_SPLICE))
-                lower == "ad=comment" ->
-                    config = config.copy(adLayer = config.adLayer.copy(mode = AdInsertionMode.PINNED_COMMENT_ONLY))
-                lower == "sub=off" ->
-                    config = config.copy(subtitleLayer = config.subtitleLayer.copy(enabled = false))
-                lower == "crop=off" ->
-                    config = config.copy(enableSmartFaceCrop = false)
-                lower == "dsp=off" ->
-                    config = config.copy(dspLayer = config.dspLayer.copy(enabled = false))
-                lower == "ai=off" ->
-                    config = config.copy(enableAiMetadataGeneration = false)
-                lower.startsWith("sub_y=") -> {
-                    val yVal = lower.removePrefix("sub_y=").toIntOrNull()
-                    if (yVal != null) {
-                        config = config.copy(
-                            subtitleLayer = config.subtitleLayer.copy(
-                                placementZone = SubtitlePlacementZone.CUSTOM_XY,
-                                customY = yVal
-                            )
-                        )
+                lower == "preset=podcast" -> config = ModularRenderConfig.presetPodcastSplit()
+                lower == "preset=edit" -> config = ModularRenderConfig.presetFullscreenEdit()
+                lower == "preset=brainrot" -> config = ModularRenderConfig.presetBrainrotStory()
+                lower == "preset=original" -> config = ModularRenderConfig.presetDistortedOriginal()
+
+                lower == "subs=off" -> config = config.copy(
+                    subtitleLayer = config.subtitleLayer.copy(enabled = false)
+                )
+                lower == "subs=on" -> config = config.copy(
+                    subtitleLayer = config.subtitleLayer.copy(enabled = true)
+                )
+                lower == "substyle=classic" -> config = config.copy(
+                    subtitleLayer = config.subtitleLayer.copy(densityMode = SubtitleDensityMode.CLASSIC_6_TO_8_WORDS)
+                )
+                lower == "substyle=punch" -> config = config.copy(
+                    subtitleLayer = config.subtitleLayer.copy(densityMode = SubtitleDensityMode.PUNCH_3_TO_4_WORDS)
+                )
+                lower.startsWith("subpos=") -> {
+                    val value = lower.removePrefix("subpos=")
+                    val zone = when (value) {
+                        "top" -> SubtitlePlacementZone.TOP_SAFE
+                        "upper" -> SubtitlePlacementZone.UPPER_THIRD
+                        "center" -> SubtitlePlacementZone.CENTER_SEAM
+                        "lower" -> SubtitlePlacementZone.LOWER_BOX_MID
+                        "bottom" -> SubtitlePlacementZone.BOTTOM_SAFE
+                        else -> SubtitlePlacementZone.ADAPTIVE_AUTO
                     }
+                    config = config.copy(
+                        subtitleLayer = config.subtitleLayer.copy(
+                            placementZone = zone,
+                            customY = zone.defaultY
+                        )
+                    )
+                }
+
+                lower == "face=off" -> config = config.copy(enableSmartFaceCrop = false)
+                lower == "face=on" -> config = config.copy(enableSmartFaceCrop = true)
+                lower == "dsp=off" -> config = config.copy(
+                    dspLayer = config.dspLayer.copy(enabled = false)
+                )
+                lower == "dsp=on" -> config = config.copy(
+                    dspLayer = config.dspLayer.copy(enabled = true)
+                )
+                lower == "ai=off" -> config = config.copy(enableAiMetadataGeneration = false)
+                lower == "ai=on" -> config = config.copy(enableAiMetadataGeneration = true)
+
+                lower.startsWith("ad=") -> {
+                    val mode = when (lower.removePrefix("ad=")) {
+                        "banner" -> AdInsertionMode.BANNER_OVERLAY
+                        "midroll" -> AdInsertionMode.MIDROLL_SPLICE
+                        "pip" -> AdInsertionMode.MIDROLL_PIP_OVERLAY
+                        "comment" -> AdInsertionMode.PINNED_COMMENT_ONLY
+                        else -> AdInsertionMode.NONE
+                    }
+                    config = config.copy(adLayer = config.adLayer.copy(mode = mode))
                 }
             }
         }
@@ -1057,18 +1281,20 @@ class TelegramBotWorker(
     }
 
     private fun cleanupSession(jobId: String) {
-        val removed = sessions.remove(jobId) ?: return
-        removed.primaryVideoFile.delete()
-        removed.latestAssFile?.delete()
+        sessions.remove(jobId)?.let { s ->
+            s.primaryVideoFile.delete()
+            s.latestAssFile?.delete()
+        }
     }
 
-    private suspend fun sendMessage(chatId: Long, text: String) = withContext(Dispatchers.IO) {
-        val activeToken = botToken
-        if (activeToken.isBlank()) return@withContext
+    private suspend fun sendMessage(chatId: Long, text: String) {
         try {
-            httpClient.post("https://api.telegram.org/bot$activeToken/sendMessage") {
+            val markupJson = jsonFormat.encodeToString(persistentMainMenuKeyboard)
+            httpClient.post("${baseUrl()}/sendMessage") {
+                contentType(ContentType.Application.FormUrlEncoded)
                 parameter("chat_id", chatId)
                 parameter("text", text)
+                parameter("reply_markup", markupJson)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send Telegram message", e)
@@ -1079,26 +1305,23 @@ class TelegramBotWorker(
         chatId: Long,
         text: String,
         keyboard: InlineKeyboardMarkup
-    ) = withContext(Dispatchers.IO) {
-        val activeToken = botToken
-        if (activeToken.isBlank()) return@withContext
+    ) {
         try {
             val markupJson = jsonFormat.encodeToString(keyboard)
-            httpClient.post("https://api.telegram.org/bot$activeToken/sendMessage") {
+            httpClient.post("${baseUrl()}/sendMessage") {
+                contentType(ContentType.Application.FormUrlEncoded)
                 parameter("chat_id", chatId)
                 parameter("text", text)
                 parameter("reply_markup", markupJson)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to send message with keyboard", e)
+            Log.e(TAG, "Failed to send Telegram message with keyboard", e)
         }
     }
 
-    private suspend fun answerCallbackQuery(callbackQueryId: String) = withContext(Dispatchers.IO) {
-        val activeToken = botToken
-        if (activeToken.isBlank()) return@withContext
+    private suspend fun answerCallbackQuery(callbackQueryId: String) {
         try {
-            httpClient.post("https://api.telegram.org/bot$activeToken/answerCallbackQuery") {
+            httpClient.post("${baseUrl()}/answerCallbackQuery") {
                 parameter("callback_query_id", callbackQueryId)
             }
         } catch (_: Exception) {
@@ -1110,21 +1333,22 @@ class TelegramBotWorker(
         videoFile: File,
         caption: String,
         keyboard: InlineKeyboardMarkup
-    ) = withContext(Dispatchers.IO) {
-        val activeToken = botToken
-        if (activeToken.isBlank()) return@withContext
+    ) {
         try {
             val markupJson = jsonFormat.encodeToString(keyboard)
-            httpClient.post("https://api.telegram.org/bot$activeToken/sendVideo") {
+            httpClient.post("${baseUrl()}/sendVideo") {
                 setBody(
                     MultiPartFormDataContent(
                         formData {
                             append("chat_id", chatId.toString())
                             append("caption", caption.take(1020))
+                            append("supports_streaming", "true")
                             append("reply_markup", markupJson)
                             append(
                                 key = "video",
-                                value = videoFile.readBytes(),
+                                value = ChannelProvider(videoFile.length()) {
+                                    videoFile.inputStream().toByteReadChannel()
+                                },
                                 headers = Headers.build {
                                     append(HttpHeaders.ContentType, "video/mp4")
                                     append(
@@ -1138,7 +1362,8 @@ class TelegramBotWorker(
                 )
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to upload preview video with keyboard", e)
+            Log.e(TAG, "Failed to upload preview video to Telegram", e)
+            sendMessage(chatId, "❌ Не удалось отправить видео-превью в Telegram: ${e.message}")
         }
     }
 
@@ -1146,11 +1371,9 @@ class TelegramBotWorker(
         chatId: Long,
         file: File,
         caption: String
-    ) = withContext(Dispatchers.IO) {
-        val activeToken = botToken
-        if (activeToken.isBlank()) return@withContext
+    ) {
         try {
-            httpClient.post("https://api.telegram.org/bot$activeToken/sendDocument") {
+            httpClient.post("${baseUrl()}/sendDocument") {
                 setBody(
                     MultiPartFormDataContent(
                         formData {
@@ -1158,7 +1381,9 @@ class TelegramBotWorker(
                             append("caption", caption.take(1020))
                             append(
                                 key = "document",
-                                value = file.readBytes(),
+                                value = ChannelProvider(file.length()) {
+                                    file.inputStream().toByteReadChannel()
+                                },
                                 headers = Headers.build {
                                     append(HttpHeaders.ContentType, "application/octet-stream")
                                     append(
@@ -1172,7 +1397,8 @@ class TelegramBotWorker(
                 )
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to upload uncompressed document ${file.name}", e)
+            Log.e(TAG, "Failed to upload uncompressed document to Telegram", e)
+            sendMessage(chatId, "❌ Не удалось отправить файл ${file.name}: ${e.message}")
         }
     }
 }

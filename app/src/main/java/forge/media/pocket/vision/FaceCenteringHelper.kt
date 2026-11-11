@@ -3,7 +3,6 @@ package forge.media.pocket.vision
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
-import android.util.Log
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import com.google.mlkit.vision.common.InputImage
@@ -32,10 +31,10 @@ sealed class UpperBoxFramingPlan {
         val speakerCount: Int
     ) : UpperBoxFramingPlan() {
         override val ffmpegVideoFilter: String
-            get() = "crop=${cropWidth}:${cropHeight}:${cropX}:${cropY},scale=1080:960:flags=lanczos,setsar=1"
+            get() = "crop=${cropWidth}:${cropHeight}:${cropX}:${cropY},scale=1080:960:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:960,setsar=1"
 
         override val summary: String
-            get() = "TightCrop(speakers=$speakerCount, x=$cropX, w=$cropWidth, h=$cropHeight)"
+            get() = "Авто-центровка (спикеров: $speakerCount)"
 
         override val hasBottomFaceRisk: Boolean
             get() = true
@@ -54,7 +53,7 @@ sealed class UpperBoxFramingPlan {
             }
 
         override val summary: String
-            get() = "WideFitMultiSpeaker(spanX=$spanX, spanW=$spanWidth -> fitted into 1080x960)"
+            get() = "Широкий кадр (2+ спикера без обрезки)"
 
         override val hasBottomFaceRisk: Boolean
             get() = false
@@ -65,7 +64,7 @@ sealed class UpperBoxFramingPlan {
             get() = "scale=1080:960:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:960:(ow-iw)/2:(oh-ih)/2:color=#101014,setsar=1"
 
         override val summary: String
-            get() = "UncroppedFullFrame(16:9 fitted into 1080x960)"
+            get() = "Без кропа (весь кадр целиком)"
 
         override val hasBottomFaceRisk: Boolean
             get() = false
@@ -75,7 +74,6 @@ sealed class UpperBoxFramingPlan {
 class FaceCenteringHelper(private val context: Context) {
 
     companion object {
-        private const val TAG = "FaceCenteringHelper"
         private const val TARGET_UPPER_W = 1080
         private const val TARGET_UPPER_H = 960
         private const val TARGET_ASPECT = TARGET_UPPER_W.toDouble() / TARGET_UPPER_H.toDouble()
@@ -97,6 +95,7 @@ class FaceCenteringHelper(private val context: Context) {
     private data class FrameFaceObservation(
         val faceCount: Int,
         val primaryCenterXNorm: Double,
+        val primaryCenterYNorm: Double,
         val minLeftNorm: Double,
         val maxRightNorm: Double
     )
@@ -104,16 +103,31 @@ class FaceCenteringHelper(private val context: Context) {
     suspend fun computeFramingPlan(
         videoFile: File,
         enableSmartFaceCrop: Boolean = true,
-        maxSampleSeconds: Int = 60
+        maxSampleSeconds: Int = 30
     ): UpperBoxFramingPlan = withContext(Dispatchers.IO) {
         if (!enableSmartFaceCrop) {
             return@withContext UpperBoxFramingPlan.UncroppedFullFrame
         }
 
         val (srcWidth, srcHeight) = probeVideoDimensions(videoFile)
-        val baseCropHeight = srcHeight
-        val baseCropWidth = (srcHeight * TARGET_ASPECT).roundToInt().coerceAtMost(srcWidth)
-        val defaultCenterX = ((srcWidth - baseCropWidth) / 2).coerceAtLeast(0)
+
+        // If the source is ALREADY vertical (e.g. 1080x1920 YouTube Short), crop a 9:8 window vertically without squashing!
+        if (srcHeight > srcWidth) {
+            val cropW = srcWidth - (srcWidth % 2)
+            val cropH = ((srcWidth / TARGET_ASPECT).roundToInt().coerceAtMost(srcHeight)).let { it - (it % 2) }
+            val defaultCropY = (((srcHeight - cropH) * 0.35).roundToInt().coerceIn(0, srcHeight - cropH)).let { it - (it % 2) }
+            return@withContext UpperBoxFramingPlan.TightCrop(
+                cropWidth = cropW,
+                cropHeight = cropH,
+                cropX = 0,
+                cropY = defaultCropY,
+                speakerCount = 1
+            )
+        }
+
+        val baseCropHeight = srcHeight - (srcHeight % 2)
+        val baseCropWidth = ((srcHeight * TARGET_ASPECT).roundToInt().coerceAtMost(srcWidth)).let { it - (it % 2) }
+        val defaultCenterX = (((srcWidth - baseCropWidth) / 2).coerceAtLeast(0)).let { it - (it % 2) }
 
         val framesDir = File(context.cacheDir, "face_samples_${System.currentTimeMillis()}").apply {
             mkdirs()
@@ -169,13 +183,16 @@ class FaceCenteringHelper(private val context: Context) {
                         val maxRight = activeSpeakers.maxOf {
                             (it.boundingBox.right.toDouble() / bmpW).coerceIn(0.0, 1.0)
                         }
-                        val domCenterNorm =
+                        val domCenterXNorm =
                             (dominant.boundingBox.centerX().toDouble() / bmpW).coerceIn(0.0, 1.0)
+                        val domCenterYNorm =
+                            (dominant.boundingBox.centerY().toDouble() / bmpH).coerceIn(0.0, 1.0)
 
                         observations.add(
                             FrameFaceObservation(
                                 faceCount = activeSpeakers.size,
-                                primaryCenterXNorm = domCenterNorm,
+                                primaryCenterXNorm = domCenterXNorm,
+                                primaryCenterYNorm = domCenterYNorm,
                                 minLeftNorm = minLeft,
                                 maxRightNorm = maxRight
                             )
@@ -219,8 +236,8 @@ class FaceCenteringHelper(private val context: Context) {
                         .let { it - (it % 2) }
 
                     UpperBoxFramingPlan.TightCrop(
-                        cropWidth = baseCropWidth - (baseCropWidth % 2),
-                        cropHeight = baseCropHeight - (baseCropHeight % 2),
+                        cropWidth = baseCropWidth,
+                        cropHeight = baseCropHeight,
                         cropX = alignedCropX,
                         cropY = 0,
                         speakerCount = 2
@@ -231,35 +248,12 @@ class FaceCenteringHelper(private val context: Context) {
                     UpperBoxFramingPlan.WideFitMultiSpeaker(
                         spanX = evenSpanX,
                         spanWidth = evenSpanW.coerceAtLeast(baseCropWidth),
-                        sourceHeight = baseCropHeight - (baseCropHeight % 2)
+                        sourceHeight = baseCropHeight
                     )
                 }
             }
 
             val centers = observations.map { it.primaryCenterXNorm }
-            val p15 = percentile(centers, 0.15)
-            val p85 = percentile(centers, 0.85)
-            val spreadPx = ((p85 - p15) * srcWidth).roundToInt()
-
-            if (spreadPx > baseCropWidth * 0.75) {
-                val paddedLeftPx = ((p15 - MULTI_FACE_MARGIN_RATIO * 1.5) * srcWidth)
-                    .roundToInt()
-                    .coerceIn(0, srcWidth - 2)
-                val paddedRightPx = ((p85 + MULTI_FACE_MARGIN_RATIO * 1.5) * srcWidth)
-                    .roundToInt()
-                    .coerceIn(paddedLeftPx + 2, srcWidth)
-                val spanW = (paddedRightPx - paddedLeftPx).let { it - (it % 2) }
-                val spanX = paddedLeftPx - (paddedLeftPx % 2)
-
-                if (spanW > baseCropWidth) {
-                    return@withContext UpperBoxFramingPlan.WideFitMultiSpeaker(
-                        spanX = spanX,
-                        spanWidth = spanW,
-                        sourceHeight = baseCropHeight - (baseCropHeight % 2)
-                    )
-                }
-            }
-
             var emaCenterNorm = median(centers)
             for (c in centers) {
                 if (abs(c - emaCenterNorm) < 0.25) {
@@ -272,8 +266,8 @@ class FaceCenteringHelper(private val context: Context) {
             val evenCropX = rawCropX - (rawCropX % 2)
 
             UpperBoxFramingPlan.TightCrop(
-                cropWidth = baseCropWidth - (baseCropWidth % 2),
-                cropHeight = baseCropHeight - (baseCropHeight % 2),
+                cropWidth = baseCropWidth,
+                cropHeight = baseCropHeight,
                 cropX = evenCropX,
                 cropY = 0,
                 speakerCount = 1
@@ -309,6 +303,11 @@ class FaceCenteringHelper(private val context: Context) {
         }
     }
 
+    fun isVerticalSource(videoFile: File): Boolean {
+        val (w, h) = probeVideoDimensions(videoFile)
+        return h > w
+    }
+
     private fun probeVideoDimensions(videoFile: File): Pair<Int, Int> {
         val retriever = MediaMetadataRetriever()
         return try {
@@ -317,7 +316,13 @@ class FaceCenteringHelper(private val context: Context) {
                 ?.toIntOrNull() ?: 1920
             val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
                 ?.toIntOrNull() ?: 1080
-            Pair(w, h)
+            val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                ?.toIntOrNull() ?: 0
+            if (rotation == 90 || rotation == 270) {
+                Pair(h, w)
+            } else {
+                Pair(w, h)
+            }
         } catch (_: Exception) {
             Pair(1920, 1080)
         } finally {
@@ -337,12 +342,5 @@ class FaceCenteringHelper(private val context: Context) {
         } else {
             sorted[mid]
         }
-    }
-
-    private fun percentile(values: List<Double>, p: Double): Double {
-        if (values.isEmpty()) return 0.5
-        val sorted = values.sorted()
-        val idx = ((sorted.size - 1) * p).roundToInt().coerceIn(0, sorted.lastIndex)
-        return sorted[idx]
     }
 }
