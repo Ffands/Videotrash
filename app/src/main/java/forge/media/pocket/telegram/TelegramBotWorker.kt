@@ -234,16 +234,11 @@ class TelegramBotWorker(
                     val svcState = PipelineForegroundService.statusFlow.value
                     sendMessage(
                         chatId = chatId,
-                        text = "⚡ Pocket Media Forge (Snapdragon ARM64)
-" +
-                            "• Ваш Chat ID: $chatId
-" +
-                            "• Статус: $svcState
-" +
-                            "• Проверенных фонов в пуле (3.3A): $poolSize шт.
-" +
-                            "• Активных сессий: ${sessions.size}
-" +
+                        text = "⚡ Pocket Media Forge (Snapdragon ARM64)\n" +
+                            "• Ваш Chat ID: $chatId\n" +
+                            "• Статус: $svcState\n" +
+                            "• Проверенных фонов в пуле (3.3A): $poolSize шт.\n" +
+                            "• Активных сессий: ${sessions.size}\n" +
                             "• Фоновый Автопилот по тегам: ${if (isAutopilotEnabled.get()) "ВКЛ (каждые $autopilotIntervalMinutes мин)" else "ПАУЗА"} (подписок: ${subs.size})"
                     )
                 }
@@ -263,27 +258,15 @@ class TelegramBotWorker(
                 else -> {
                     sendMessage(
                         chatId = chatId,
-                        text = "🛠 Команды Pocket Media Forge:
-
-" +
-                            "1️⃣ Поиск видео по твоим тегам и тематикам:
-" +
-                            "• /hunt <теги/тема> — откроет пульт выбора сортировки (Популярное / Новизна / Взлетающее) и периода (24ч / Неделя / Месяц / Всё время)
-
-" +
-                            "2️⃣ Фоновый Автопилот по тегам:
-" +
-                            "• /autotags add <теги> [sort=top|new|hot] [period=day|week|month]
-" +
-                            "• /autotags list — список подписок и пульт Автопилота
-" +
-                            "• /autotags del <номер>
-
-" +
-                            "3️⃣ Сборка по прямой ссылке:
-" +
-                            "• /process <url> [preset=podcast|edit|brainrot|original]
-" +
+                        text = "🛠 Команды Pocket Media Forge:\n\n" +
+                            "1️⃣ Поиск видео по твоим тегам и тематикам:\n" +
+                            "• /hunt <теги/тема> — откроет пульт выбора сортировки (Популярное / Новизна / Взлетающее) и периода (24ч / Неделя / Месяц / Всё время)\n\n" +
+                            "2️⃣ Фоновый Автопилот по тегам:\n" +
+                            "• /autotags add <теги> [sort=top|new|hot] [period=day|week|month]\n" +
+                            "• /autotags list — список подписок и пульт Автопилота\n" +
+                            "• /autotags del <номер>\n\n" +
+                            "3️⃣ Сборка по прямой ссылке:\n" +
+                            "• /process <url> [preset=podcast|edit|brainrot|original]\n" +
                             "• /status"
                     )
                 }
@@ -304,13 +287,9 @@ class TelegramBotWorker(
         if (queryRaw.isBlank()) {
             sendMessage(
                 chatId,
-                "🔎 Укажи теги или тематику после /hunt.
-Примеры:
-" +
-                    "• /hunt аниме эдит магическая битва
-" +
-                    "• /hunt стендап отношения
-" +
+                "🔎 Укажи теги или тематику после /hunt.\nПримеры:\n" +
+                    "• /hunt аниме эдит магическая битва\n" +
+                    "• /hunt стендап отношения\n" +
                     "• /hunt пикабу физика залипашка"
             )
             return
@@ -366,18 +345,11 @@ class TelegramBotWorker(
         state: PendingHuntFilterState
     ) {
         val text = buildString {
-            append("🎯 Поиск контента по тегам: «").append(state.queryTags).append("»
-
-")
-            append("• Площадка: ").append(state.platform.label).append("
-")
-            append("• Сортировка: ").append(state.sortOrder.label).append("
-")
-            append("• Период: ").append(state.period.label).append("
-")
-            append("• Количество роликов: ").append(state.count).append(" шт.
-
-")
+            append("🎯 Поиск контента по тегам: «").append(state.queryTags).append("»\n\n")
+            append("• Площадка: ").append(state.platform.label).append("\n")
+            append("• Сортировка: ").append(state.sortOrder.label).append("\n")
+            append("• Период: ").append(state.period.label).append("\n")
+            append("• Количество роликов: ").append(state.count).append(" шт.\n\n")
             append("Настрой фильтры кнопками ниже или сразу жми «🚀 Найти и собрать превью»:")
         }
 
@@ -490,16 +462,12 @@ class TelegramBotWorker(
         subs: List<AutopilotTagSubscription>
     ) {
         val statusStr = if (isAutopilotEnabled.get()) "🟢 АКТИВЕН (каждые $autopilotIntervalMinutes мин)" else "⏸ НА ПАУЗЕ"
-        val sb = StringBuilder("🤖 Фоновый Автопилот по тегам: $statusStr
-
-")
+        val sb = StringBuilder("🤖 Фоновый Автопилот по тегам: $statusStr\n\n")
         if (subs.isEmpty()) {
-            sb.append("Список тегов пуст. Добавь через:
-/autotags add аниме эдит sort=top period=week")
+            sb.append("Список тегов пуст. Добавь через:\n/autotags add аниме эдит sort=top period=week")
         } else {
             subs.forEachIndexed { idx, s ->
-                sb.append("${idx + 1}. «${s.queryTags}» [${s.platform.name} | ${s.sortOrder.name} | ${s.period.label}]
-")
+                sb.append("${idx + 1}. «${s.queryTags}» [${s.platform.name} | ${s.sortOrder.name} | ${s.period.label}]\n")
             }
         }
 
@@ -569,8 +537,7 @@ class TelegramBotWorker(
 
         sendMessage(
             chatId = chatId,
-            text = "⏳ Задача #$jobId в очереди Snapdragon MediaCodec.
-" +
+            text = "⏳ Задача #$jobId в очереди Snapdragon MediaCodec.\n" +
                 "Качаю исходник, проверяю фон (3.3A), центрирую лицо (ML Kit) и собираю 5-сек превью..."
         )
 
@@ -641,32 +608,25 @@ class TelegramBotWorker(
 
         val (_, resolvedSubY) = session.config.subtitleLayer.resolveCoordinates(session.framingPlan)
         val caption = buildString {
-            append("🎬 Превью #").append(session.jobId).append(" (5 сек)
-")
+            append("🎬 Превью #").append(session.jobId).append(" (5 сек)\n")
             if (session.originalTitle.isNotBlank()) {
                 append("📌 Исходник: ").append(session.originalTitle.take(60))
                 if (session.originalAuthor.isNotBlank()) {
                     append(" (").append(session.originalAuthor).append(")")
                 }
-                append("
-")
+                append("\n")
             }
-            append("• Режим: ").append(session.config.layoutLayer.label).append("
-")
-            append("• Кроп лица: ").append(session.framingPlan.summary).append("
-")
+            append("• Режим: ").append(session.config.layoutLayer.label).append("\n")
+            append("• Кроп лица: ").append(session.framingPlan.summary).append("\n")
             append("• Субтитры: ").append(
                 if (session.config.subtitleLayer.enabled) {
                     "ВКЛ (${session.config.subtitleLayer.placementZone.label}, Y=$resolvedSubY)"
                 } else {
                     "ВЫКЛ"
                 }
-            ).append("
-")
-            append("• Обход Content ID (Зум+Питч+Паузы): ").append(if (session.config.dspLayer.enabled) "ВКЛ" else "ВЫКЛ").append("
-")
-            append("• Реклама: ").append(session.config.adLayer.mode).append("
-")
+            ).append("\n")
+            append("• Обход Content ID (Зум+Питч+Паузы): ").append(if (session.config.dspLayer.enabled) "ВКЛ" else "ВЫКЛ").append("\n")
+            append("• Реклама: ").append(session.config.adLayer.mode).append("\n")
             append("• AI-Описание (3 названия + тайтл): ").append(if (session.config.enableAiMetadataGeneration) "ВКЛ" else "ВЫКЛ")
         }
 
@@ -967,28 +927,17 @@ class TelegramBotWorker(
         )
 
         val caption = buildString {
-            append("✅ Готовый рендер #").append(session.jobId).append(" (Без сжатия)
-")
-            append("📁 На телефоне: Downloads/PocketMediaForge/Job_").append(session.jobId).append("
-
-")
+            append("✅ Готовый рендер #").append(session.jobId).append(" (Без сжатия)\n")
+            append("📁 На телефоне: Downloads/PocketMediaForge/Job_").append(session.jobId).append("\n\n")
             if (metadata != null) {
-                append("🎯 3 варианта названия:
-")
+                append("🎯 3 варианта названия:\n")
                 metadata.titles.forEachIndexed { idx, t ->
-                    append("  ").append(idx + 1).append(") ").append(t).append("
-")
+                    append("  ").append(idx + 1).append(") ").append(t).append("\n")
                 }
-                append("
-🎬 Источник / Тайтл: ").append(metadata.sourceAttribution).append("
-")
-                append("📝 Описание: ").append(metadata.description).append("
-")
-                append("🏷 Хэштеги: ").append(metadata.hashtags.joinToString(" ")).append("
-
-")
-                append("📌 Закреплённый комментарий:
-").append(metadata.pinnedComment)
+                append("\n🎬 Источник / Тайтл: ").append(metadata.sourceAttribution).append("\n")
+                append("📝 Описание: ").append(metadata.description).append("\n")
+                append("🏷 Хэштеги: ").append(metadata.hashtags.joinToString(" ")).append("\n\n")
+                append("📌 Закреплённый комментарий:\n").append(metadata.pinnedComment)
             }
         }
 
@@ -1027,10 +976,8 @@ class TelegramBotWorker(
 
         sendMessage(
             chatId = session.chatId,
-            text = "📂 Все исходники для ручной сборки сохранены на телефоне в:
-" +
-                "Downloads/PocketMediaForge/Job_${session.jobId}_RAW/
-" +
+            text = "📂 Все исходники для ручной сборки сохранены на телефоне в:\n" +
+                "Downloads/PocketMediaForge/Job_${session.jobId}_RAW/\n" +
                 "Выгружаю файлы без сжатия..."
         )
 
