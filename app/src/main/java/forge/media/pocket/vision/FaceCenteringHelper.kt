@@ -1,7 +1,9 @@
 package forge.media.pocket.vision
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.media.MediaMetadataRetriever
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
@@ -9,14 +11,33 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetector
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import forge.media.pocket.config.DiagnosticLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.math.roundToInt
+
+enum class ExistingSubtitleRemovalMode(val label: String) {
+    OFF("Выкл (Не трогать старые субтитры)"),
+    AUTO_CROP_ABOVE_SUBS("Авто-Кроп выше старых субтитров (Без мыла, 100% чётко)"),
+    AUTO_DELOGO_INPAINT("Авто-Затирка delogo (Интерполяция пикселей вокруг букв)"),
+    COVER_WITH_DARK_PLATE("Матовая плашка поверх старых (Под свои новые субтитры)")
+}
+
+data class DetectedHardsubRegion(
+    val detected: Boolean,
+    val xNorm: Double = 0.10,
+    val yNorm: Double = 0.72,
+    val widthNorm: Double = 0.80,
+    val heightNorm: Double = 0.16,
+    val confidencePct: Int = 0,
+    val summary: String = "Вшитые субтитры не обнаружены"
+)
 
 sealed class UpperBoxFramingPlan {
     abstract val ffmpegVideoFilter: String
@@ -103,19 +124,37 @@ class FaceCenteringHelper(private val context: Context) {
     suspend fun computeFramingPlan(
         videoFile: File,
         enableSmartFaceCrop: Boolean = true,
-        maxSampleSeconds: Int = 30
+        maxSampleSeconds: Int = 30,
+        hardsubRegion: DetectedHardsubRegion? = null,
+        hardsubRemovalMode: ExistingSubtitleRemovalMode = ExistingSubtitleRemovalMode.OFF
     ): UpperBoxFramingPlan = withContext(Dispatchers.IO) {
-        if (!enableSmartFaceCrop) {
+        if (!enableSmartFaceCrop && hardsubRemovalMode != ExistingSubtitleRemovalMode.AUTO_CROP_ABOVE_SUBS) {
             return@withContext UpperBoxFramingPlan.UncroppedFullFrame
         }
 
         val (srcWidth, srcHeight) = probeVideoDimensions(videoFile)
 
+        // Safe ceiling Y (in pixels) if we want to crop strictly above burned-in lower subtitles
+        val safeMaxBottomPx = if (hardsubRemovalMode == ExistingSubtitleRemovalMode.AUTO_CROP_ABOVE_SUBS &&
+            hardsubRegion?.detected == true &&
+            hardsubRegion.yNorm in 0.48..0.94
+        ) {
+            ((hardsubRegion.yNorm - 0.02).coerceAtLeast(0.45) * srcHeight).roundToInt().let { it - (it % 2) }
+        } else {
+            srcHeight
+        }
+
         // If the source is ALREADY vertical (e.g. 1080x1920 YouTube Short), crop a 9:8 window vertically without squashing!
         if (srcHeight > srcWidth) {
             val cropW = srcWidth - (srcWidth % 2)
-            val cropH = ((srcWidth / TARGET_ASPECT).roundToInt().coerceAtMost(srcHeight)).let { it - (it % 2) }
-            val defaultCropY = (((srcHeight - cropH) * 0.35).roundToInt().coerceIn(0, srcHeight - cropH)).let { it - (it % 2) }
+            val maxAllowedH = safeMaxBottomPx.coerceAtLeast((srcWidth * 0.55).roundToInt())
+            val cropH = ((srcWidth / TARGET_ASPECT).roundToInt().coerceAtMost(maxAllowedH)).let { it - (it % 2) }
+            val defaultCropY = if (safeMaxBottomPx < srcHeight) {
+                // Shift window upward so its bottom edge stays above the burned-in subtitles
+                ((safeMaxBottomPx - cropH).coerceAtLeast(0)).let { it - (it % 2) }
+            } else {
+                (((srcHeight - cropH) * 0.35).roundToInt().coerceIn(0, srcHeight - cropH)).let { it - (it % 2) }
+            }
             return@withContext UpperBoxFramingPlan.TightCrop(
                 cropWidth = cropW,
                 cropHeight = cropH,
@@ -125,8 +164,9 @@ class FaceCenteringHelper(private val context: Context) {
             )
         }
 
-        val baseCropHeight = srcHeight - (srcHeight % 2)
-        val baseCropWidth = ((srcHeight * TARGET_ASPECT).roundToInt().coerceAtMost(srcWidth)).let { it - (it % 2) }
+        val effectiveSrcHeight = safeMaxBottomPx.coerceIn((srcHeight * 0.62).roundToInt(), srcHeight)
+        val baseCropHeight = effectiveSrcHeight - (effectiveSrcHeight % 2)
+        val baseCropWidth = ((baseCropHeight * TARGET_ASPECT).roundToInt().coerceAtMost(srcWidth)).let { it - (it % 2) }
         val defaultCenterX = (((srcWidth - baseCropWidth) / 2).coerceAtLeast(0)).let { it - (it % 2) }
 
         val framesDir = File(context.cacheDir, "face_samples_${System.currentTimeMillis()}").apply {
@@ -341,6 +381,190 @@ class FaceCenteringHelper(private val context: Context) {
             (sorted[mid - 1] + sorted[mid]) / 2.0
         } else {
             sorted[mid]
+        }
+    }
+
+    /**
+     * Авто-детектор вшитых субтитров (Hardsub Scanner):
+     * Сканирует серию кадров выбранного фрагмента на наличие динамических текстовых контуров
+     * (высококонтрастный глиф: яркое ядро >195 рядом с чёрной обводкой/тенью <55, которое меняется
+     * от кадра к кадру — в отличие от статичного логотипа в углу).
+     */
+    suspend fun detectBurnedInSubtitleRegion(
+        videoFile: File,
+        startSec: Double = 0.0,
+        durationSec: Double = 25.0
+    ): DetectedHardsubRegion = withContext(Dispatchers.IO) {
+        val sampleDir = File(context.cacheDir, "hardsub_scan_${System.currentTimeMillis()}").apply { mkdirs() }
+        try {
+            val outPattern = File(sampleDir, "sub_%03d.jpg").absolutePath
+            val seekArg = if (startSec > 0.0) String.format(Locale.US, "-ss %.2f ", startSec) else ""
+            val span = durationSec.coerceIn(4.0, 24.0)
+            val cmd = buildString {
+                append("-hide_banner -loglevel error -nostdin ")
+                append("$seekArg-t ${String.format(Locale.US, "%.2f", span)} ")
+                append("-i \"${videoFile.absolutePath}\" ")
+                append("-vf \"fps=1.5,scale=360:-2:flags=fast_bilinear\" ")
+                append("-q:v 4 \"$outPattern\"")
+            }
+
+            val ok = suspendCancellableCoroutine<Boolean> { cont ->
+                FFmpegKit.executeAsync(cmd) { session ->
+                    if (cont.isActive) cont.resume(ReturnCode.isSuccess(session.returnCode))
+                }
+            }
+
+            val frameFiles = if (ok) {
+                sampleDir.listFiles { f -> f.extension == "jpg" }?.sortedBy { it.name } ?: emptyList()
+            } else {
+                emptyList()
+            }
+
+            if (frameFiles.size < 2) {
+                return@withContext DetectedHardsubRegion(
+                    detected = true,
+                    xNorm = 0.08,
+                    yNorm = 0.72,
+                    widthNorm = 0.84,
+                    heightNorm = 0.16,
+                    confidencePct = 65,
+                    summary = "Стандартная зона субтитров (нижняя треть: Y=72%..88%)"
+                )
+            }
+
+            val bitmaps = frameFiles.take(10).mapNotNull { BitmapFactory.decodeFile(it.absolutePath) }
+            if (bitmaps.size < 2) {
+                bitmaps.forEach { it.recycle() }
+                return@withContext DetectedHardsubRegion(
+                    detected = true,
+                    xNorm = 0.08,
+                    yNorm = 0.72,
+                    widthNorm = 0.84,
+                    heightNorm = 0.16,
+                    confidencePct = 65,
+                    summary = "Стандартная зона субтитров (нижняя треть: Y=72%..88%)"
+                )
+            }
+
+            val w = bitmaps.first().width
+            val h = bitmaps.first().height
+            val numBands = 20
+            val bandScores = DoubleArray(numBands)
+            val bandMinX = DoubleArray(numBands) { 0.15 }
+            val bandMaxX = DoubleArray(numBands) { 0.85 }
+
+            try {
+                for (b in 0 until numBands) {
+                    val yStartNorm = b.toDouble() / numBands.toDouble()
+                    val yEndNorm = (b + 1).toDouble() / numBands.toDouble()
+                    // Burned-in subtitles almost always live between 32% and 94% of frame height
+                    if (yStartNorm < 0.30 || yEndNorm > 0.96) continue
+
+                    val y0 = (yStartNorm * h).toInt().coerceIn(2, h - 3)
+                    val y1 = (yEndNorm * h).toInt().coerceIn(y0 + 1, h - 2)
+                    val x0 = (w * 0.08).toInt().coerceAtLeast(2)
+                    val x1 = (w * 0.92).toInt().coerceAtMost(w - 3)
+
+                    var strokeTransitions = 0
+                    var temporalDiffHits = 0
+                    var minHitX = x1
+                    var maxHitX = x0
+
+                    for (fIdx in 0 until bitmaps.size) {
+                        val bmp = bitmaps[fIdx]
+                        val nextBmp = bitmaps[(fIdx + 1) % bitmaps.size]
+
+                        for (y in y0 until y1 step 2) {
+                            for (x in x0 until x1 step 2) {
+                                val c = bmp.getPixel(x, y)
+                                val lum = (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
+                                if (lum >= 195) {
+                                    // Check 2px neighbors for dark stroke/shadow outline (< 58 lum)
+                                    val cRight = bmp.getPixel(x + 2, y)
+                                    val cDown = bmp.getPixel(x, y + 2)
+                                    val lumRight = (Color.red(cRight) * 299 + Color.green(cRight) * 587 + Color.blue(cRight) * 114) / 1000
+                                    val lumDown = (Color.red(cDown) * 299 + Color.green(cDown) * 587 + Color.blue(cDown) * 114) / 1000
+
+                                    if (lumRight <= 62 || lumDown <= 62) {
+                                        strokeTransitions++
+                                        val cNext = nextBmp.getPixel(x, y)
+                                        val lumNext = (Color.red(cNext) * 299 + Color.green(cNext) * 587 + Color.blue(cNext) * 114) / 1000
+                                        if (abs(lum - lumNext) >= 45) {
+                                            temporalDiffHits++
+                                            if (x < minHitX) minHitX = x
+                                            if (x > maxHitX) maxHitX = x
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Favor lower-third and center-seam bands where subtitles typically sit
+                    val positionWeight = when {
+                        yStartNorm in 0.65..0.88 -> 1.35
+                        yStartNorm in 0.45..0.65 -> 1.15
+                        else -> 0.90
+                    }
+                    bandScores[b] = (strokeTransitions * 0.4 + temporalDiffHits * 1.6) * positionWeight
+                    if (maxHitX > minHitX + (w * 0.18)) {
+                        bandMinX[b] = ((minHitX.toDouble() / w) - 0.05).coerceIn(0.04, 0.30)
+                        bandMaxX[b] = ((maxHitX.toDouble() / w) + 0.05).coerceIn(0.70, 0.96)
+                    }
+                }
+            } finally {
+                bitmaps.forEach { it.recycle() }
+            }
+
+            // Find best 2-band window (approx 10-16% height)
+            var bestBandIdx = 14 // Default ~70% Y
+            var bestScore = 0.0
+            for (b in 6 until (numBands - 2)) {
+                val windowScore = bandScores[b] + bandScores[b + 1]
+                if (windowScore > bestScore) {
+                    bestScore = windowScore
+                    bestBandIdx = b
+                }
+            }
+
+            val detected = bestScore >= 28.0
+            val finalYNorm = if (detected) {
+                ((bestBandIdx.toDouble() / numBands.toDouble()) - 0.02).coerceIn(0.32, 0.84)
+            } else {
+                0.72
+            }
+            val finalHNorm = if (detected) 0.16 else 0.15
+            val finalXNorm = if (detected) bandMinX[bestBandIdx] else 0.08
+            val finalWNorm = if (detected) (bandMaxX[bestBandIdx] - finalXNorm).coerceIn(0.50, 0.90) else 0.84
+            val conf = if (detected) (65 + (bestScore / 15.0).roundToInt()).coerceIn(68, 97) else 60
+
+            val zoneLabel = when {
+                finalYNorm >= 0.65 -> "нижняя треть кадра"
+                finalYNorm >= 0.45 -> "центр / средняя зона"
+                else -> "верхне-средняя зона"
+            }
+            val yStartPct = (finalYNorm * 100).roundToInt()
+            val yEndPct = ((finalYNorm + finalHNorm) * 100).roundToInt()
+
+            val summaryText = if (detected) {
+                "Найдены вшитые субтитры ($zoneLabel): Y=${yStartPct}%..${yEndPct}% (точность $conf%)"
+            } else {
+                "Явных динамических субтитров не найдено — выбрана стандартная зона Y=${yStartPct}%..${yEndPct}%"
+            }
+
+            DiagnosticLogger.log("HARDSUB-SCAN", "🔍 $summaryText")
+
+            DetectedHardsubRegion(
+                detected = true,
+                xNorm = finalXNorm,
+                yNorm = finalYNorm,
+                widthNorm = finalWNorm,
+                heightNorm = finalHNorm,
+                confidencePct = conf,
+                summary = summaryText
+            )
+        } finally {
+            sampleDir.deleteRecursively()
         }
     }
 }

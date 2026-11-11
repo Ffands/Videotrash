@@ -1,12 +1,17 @@
 package forge.media.pocket.subtitles
 
 import android.content.Context
+import android.net.Uri
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Base64
 import android.util.Log
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
+import forge.media.pocket.config.DiagnosticLogger
 import forge.media.pocket.config.NodeConfigStore
 import forge.media.pocket.vision.UpperBoxFramingPlan
 import io.ktor.client.HttpClient
@@ -15,18 +20,32 @@ import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import java.io.File
 import java.util.Locale
+import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
+
+enum class TtsVoiceProfile(val geminiVoiceName: String, val pitch: Float, val rate: Float, val label: String) {
+    CHARON_DEEP("Charon", 0.88f, 1.04f, "Мужской баритон (Charon)"),
+    FENRIR_DYNAMIC("Fenrir", 1.0f, 1.10f, "Мужской бодрый (Fenrir)"),
+    KORE_FEMALE("Kore", 1.08f, 1.05f, "Женский чёткий (Kore)"),
+    PUCK_STORYTELLER("Puck", 0.96f, 1.06f, "Рассказчик (Puck)")
+}
 
 enum class SubtitleDensityMode {
     PUNCH_3_TO_4_WORDS,
@@ -50,7 +69,7 @@ data class SubtitleLayerConfig(
     val customX: Int = 540,
     val customY: Int = 960,
     val fontSizePx: Int = 68,
-    val preferredLanguage: String = "ru,en"
+    val preferredLanguage: String = "ru.*,ru-orig,ru,en.*,en"
 ) {
     fun resolveCoordinates(framingPlan: UpperBoxFramingPlan?): Pair<Int, Int> {
         val x = customX.coerceIn(140, 940)
@@ -74,6 +93,13 @@ data class TimedWord(
 data class SubtitlePreparationResult(
     val assFile: File?,
     val plainTranscriptText: String
+)
+
+data class MusicShazamMatchResult(
+    val detectedTrackAndGenre: String,
+    val moodAndBpm: String,
+    val searchQueries: List<String>,
+    val candidateTracks: List<Pair<String, String>> = emptyList() // Pair(url, title)
 )
 
 class SubtitleAssTransformer(
@@ -306,16 +332,23 @@ class SubtitleAssTransformer(
     private suspend fun transcribeViaGeminiAudioFallback(videoFile: File): List<TimedWord> =
         withContext(Dispatchers.IO) {
             val apiKey = configStore.getGeminiApiKey()
-            if (apiKey.isBlank()) return@withContext emptyList()
+            if (apiKey.isBlank()) {
+                DiagnosticLogger.log("SUBS", "Ключ Gemini пуст, а VTT субтитры на YouTube отсутствуют -> слов=0")
+                return@withContext emptyList()
+            }
 
-            val tempAudio = File(stagingDir, "stt_${System.currentTimeMillis()}.ogg")
+            val tempAudio = File(stagingDir, "stt_${System.currentTimeMillis()}.m4a")
             try {
-                val extracted = extractCompactOggAudio(videoFile, tempAudio)
-                if (!extracted || !tempAudio.exists()) return@withContext emptyList()
+                val extracted = extractCompactM4aAudio(videoFile, tempAudio)
+                if (!extracted || !tempAudio.exists()) {
+                    DiagnosticLogger.log("SUBS", "Не удалось извлечь аудиодорожку .m4a для субтитров")
+                    return@withContext emptyList()
+                }
 
+                DiagnosticLogger.log("SUBS", "Отправка аудио (${tempAudio.length() / 1024} KB) в Gemini 2.5 Flash для таймкодов...")
                 val base64Audio = Base64.encodeToString(tempAudio.readBytes(), Base64.NO_WRAP)
                 val prompt = """
-                    Transcribe the speech in this audio into short phrases of 3 to 5 words.
+                    Transcribe the speech in this audio into short phrases of 3 to 5 words (keep the original language, e.g. Russian).
                     Return strictly a JSON array of objects with fields:
                     [{"startSec": 0.0, "endSec": 1.4, "text": "phrase text"}]
                 """.trimIndent()
@@ -327,7 +360,7 @@ class SubtitleAssTransformer(
                                 GeminiPart(text = prompt),
                                 GeminiPart(
                                     inlineData = GeminiInlineData(
-                                        mimeType = "audio/ogg",
+                                        mimeType = "audio/mp4",
                                         data = base64Audio
                                     )
                                 )
@@ -350,6 +383,9 @@ class SubtitleAssTransformer(
 
                 val rawJson = response.candidates.firstOrNull()
                     ?.content?.parts?.firstOrNull()?.text
+                    ?.replace("```json", "")
+                    ?.replace("```", "")
+                    ?.trim()
                     ?: return@withContext emptyList()
 
                 val segments = jsonFormat.decodeFromString<List<TranscribedSegmentDto>>(rawJson)
@@ -368,23 +404,25 @@ class SubtitleAssTransformer(
                         words.add(TimedWord(token, wStart, wEnd))
                     }
                 }
+                DiagnosticLogger.log("SUBS", "✅ Gemini распознал ${words.size} слов для караоке-субтитров")
                 words
             } catch (e: Exception) {
                 Log.e(TAG, "Gemini audio fallback transcription failed", e)
+                DiagnosticLogger.logError("SUBS", "Ошибка распознавания речи через Gemini", e)
                 emptyList()
             } finally {
                 tempAudio.delete()
             }
         }
 
-    private suspend fun extractCompactOggAudio(inputVideo: File, outputOgg: File): Boolean =
+    private suspend fun extractCompactM4aAudio(inputVideo: File, outputM4a: File): Boolean =
         suspendCancellableCoroutine { cont ->
             val cmd = buildString {
                 append("-hide_banner -loglevel error -nostdin -y ")
-                append("-t 65 ")
+                append("-t 90 ")
                 append("-i \"${inputVideo.absolutePath}\" ")
-                append("-vn -ac 1 -ar 16000 -c:a libopus -b:a 24k ")
-                append("\"${outputOgg.absolutePath}\"")
+                append("-vn -ac 1 -ar 16000 -c:a aac -b:a 32k ")
+                append("\"${outputM4a.absolutePath}\"")
             }
             FFmpegKit.executeAsync(cmd) { session ->
                 if (cont.isActive) cont.resume(ReturnCode.isSuccess(session.returnCode))
@@ -482,5 +520,540 @@ class SubtitleAssTransformer(
         val s = totalSec % 60L
         val cs = (clamped % 1000L) / 10L
         return String.format(Locale.US, "%d:%02d:%02d.%02d", h, m, s, cs)
+    }
+
+    // =========================================================================
+    // ИНСТРУМЕНТ ПЕРЕОЗВУЧКИ: ИИ-РЕРАЙТ / ПЕРЕВОД РЕЧИ + НЕЙРО-СИНТЕЗ (TTS)
+    // =========================================================================
+
+    suspend fun generateDubbingScriptFromVideo(
+        sourceUrl: String,
+        localVideoFile: File,
+        startSec: Double,
+        endSec: Double,
+        isolatedVocalStemFile: File? = null
+    ): String = withContext(Dispatchers.IO) {
+        val durationSpan = ((if (endSec > startSec + 1.0) endSec - startSec else 30.0)).coerceIn(4.0, 90.0)
+        val targetWordCount = (durationSpan * 2.3).toInt().coerceIn(8, 190)
+
+        DiagnosticLogger.log(
+            "DUB-SCRIPT",
+            "Извлекаю речь из куска ${String.format(Locale.US, "%.1f..%.1fс", startSec, endSec)} (~$targetWordCount слов, только верхний голос=${isolatedVocalStemFile != null})..."
+        )
+
+        // 1. Try YouTube VTT first ONLY if user did not explicitly isolate the top vocal stem
+        var rawTranscriptSegment = ""
+        if (isolatedVocalStemFile == null && sourceUrl.startsWith("http")) {
+            val vttFile = tryDownloadYoutubeVtt(sourceUrl, "ru.*,ru-orig,ru,en.*,en")
+            if (vttFile != null && vttFile.exists()) {
+                val words = parseWebVttToTimedWords(vttFile.readText())
+                vttFile.delete()
+                val startMs = (startSec * 1000).toLong()
+                val endMs = if (endSec > startSec + 1.0) (endSec * 1000).toLong() else Long.MAX_VALUE
+                val sliceWords = words.filter { it.startMs in startMs..endMs }.ifEmpty { words }
+                rawTranscriptSegment = sliceWords.joinToString(" ") { it.text }.take(2800)
+            }
+        }
+
+        val apiKey = configStore.getGeminiApiKey().trim()
+        if (apiKey.isBlank()) {
+            return@withContext if (rawTranscriptSegment.isNotBlank()) {
+                rawTranscriptSegment
+            } else {
+                "Укажите Gemini API Key во вкладке «⚙️ Ключи/Лог» для авто-расшифровки и рерайта речи, либо напишите свой текст переозвучки прямо в это поле."
+            }
+        }
+
+        val tempAudio = File(stagingDir, "dub_slice_${System.currentTimeMillis()}.m4a")
+        try {
+            val partsList = mutableListOf<GeminiPart>()
+            val promptText = buildString {
+                append("Ты — профессиональный автор закадровой переозвучки для YouTube Shorts и Reels.\n")
+                append("Хронометраж куска видео: ${durationSpan.toInt()} секунд (нужен текст примерно на $targetWordCount слов, чтобы диктор спокойно уложился во время ролика).\n")
+                append("ЗАДАЧА:\n")
+                append("1. Слушай ТОЛЬКО наложенный сверху голос диктора/рассказчика (игнорируй фоновые шумы и крики самого видео).\n")
+                append("2. Если речь на английском или другом иностранном языке — сделай живой, динамичный русский перевод для закадровой озвучки.\n")
+                append("3. Если речь уже на русском — сделай качественный рерайт своими словами (пересказ с сохранением всех панчей, фактов и динамики), чтобы текст стал 100% уникальным.\n")
+                append("4. Верни ТОЛЬКО чистый готовый текст для диктора на русском языке (без таймкодов, без скобок и без пояснений).\n")
+                if (rawTranscriptSegment.isNotBlank()) {
+                    append("\nИсходная расшифровка куска:\n$rawTranscriptSegment")
+                }
+            }
+            partsList.add(GeminiPart(text = promptText))
+
+            if (isolatedVocalStemFile != null && isolatedVocalStemFile.exists()) {
+                val b64 = Base64.encodeToString(isolatedVocalStemFile.readBytes(), Base64.NO_WRAP)
+                partsList.add(GeminiPart(inlineData = GeminiInlineData(mimeType = "audio/mp4", data = b64)))
+            } else if (rawTranscriptSegment.isBlank()) {
+                val ok = extractSliceM4aAudio(localVideoFile, startSec, durationSpan, tempAudio)
+                if (ok && tempAudio.exists()) {
+                    val b64 = Base64.encodeToString(tempAudio.readBytes(), Base64.NO_WRAP)
+                    partsList.add(GeminiPart(inlineData = GeminiInlineData(mimeType = "audio/mp4", data = b64)))
+                }
+            }
+
+            val reqPayload = GeminiGenerateRequest(
+                contents = listOf(GeminiContent(parts = partsList)),
+                generationConfig = GeminiGenerationConfig(
+                    temperature = 0.35,
+                    responseMimeType = "text/plain"
+                )
+            )
+
+            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+            val response: GeminiGenerateResponse = httpClient.post(endpoint) {
+                contentType(ContentType.Application.Json)
+                setBody(reqPayload)
+            }.body()
+
+            val generatedScript = response.candidates.firstOrNull()
+                ?.content?.parts?.firstOrNull()?.text
+                ?.trim()
+                .orEmpty()
+
+            if (generatedScript.isNotBlank()) {
+                DiagnosticLogger.log("DUB-SCRIPT", "✅ Готов скрипт переозвучки (${generatedScript.length} симв.)")
+                generatedScript
+            } else {
+                rawTranscriptSegment.ifBlank { "Не удалось извлечь речь — введите текст озвучки вручную." }
+            }
+        } catch (e: Exception) {
+            DiagnosticLogger.logError("DUB-SCRIPT", "Ошибка генерации скрипта переозвучки", e)
+            rawTranscriptSegment.ifBlank { "Ошибка Gemini: ${e.message?.take(100)}" }
+        } finally {
+            tempAudio.delete()
+        }
+    }
+
+    suspend fun synthesizeVoiceoverToAudioFile(
+        scriptText: String,
+        voiceProfile: TtsVoiceProfile = TtsVoiceProfile.CHARON_DEEP
+    ): File = withContext(Dispatchers.IO) {
+        val cleanText = scriptText.trim()
+        if (cleanText.isBlank()) {
+            throw IllegalArgumentException("Текст для озвучки пуст!")
+        }
+
+        val apiKey = configStore.getGeminiApiKey().trim()
+        if (apiKey.isNotBlank()) {
+            try {
+                DiagnosticLogger.log(
+                    "DUB-TTS",
+                    "🎙 Генерация нейросетевой озвучки через Gemini 2.5 Flash TTS (голос=${voiceProfile.geminiVoiceName})..."
+                )
+                val geminiFile = trySynthesizeViaGeminiNeuralTts(cleanText, voiceProfile, apiKey)
+                if (geminiFile != null && geminiFile.exists() && geminiFile.length() > 1000L) {
+                    DiagnosticLogger.log(
+                        "DUB-TTS",
+                        "✅ Нейро-озвучка Gemini готова: ${geminiFile.name} (${geminiFile.length() / 1024} KB)"
+                    )
+                    return@withContext geminiFile
+                }
+            } catch (e: Exception) {
+                DiagnosticLogger.logError("DUB-TTS", "Предупреждение Gemini TTS (переключаюсь на встроенный синтезатор Android)", e)
+            }
+        }
+
+        DiagnosticLogger.log("DUB-TTS", "🎙 Синтез озвучки через локальный движок Android TextToSpeech (${voiceProfile.label})...")
+        val localWav = synthesizeViaAndroidSystemTts(cleanText, voiceProfile)
+        if (localWav != null && localWav.exists() && localWav.length() > 500L) {
+            DiagnosticLogger.log("DUB-TTS", "✅ Локальная озвучка готова: ${localWav.name} (${localWav.length() / 1024} KB)")
+            return@withContext localWav
+        }
+
+        throw IllegalStateException("Не удалось синтезировать озвучку (проверьте ключ Gemini или голосовой движок Android).")
+    }
+
+    suspend fun importCustomVoiceoverUri(uri: Uri): File = withContext(Dispatchers.IO) {
+        val outFile = File(stagingDir, "voiceover_custom_${System.currentTimeMillis()}.m4a")
+        val rawTemp = File(stagingDir, "vo_raw_${UUID.randomUUID()}")
+        try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                rawTemp.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            } ?: throw IllegalStateException("Не удалось открыть аудиофайл")
+
+            val ok = convertAudioToNormalizedM4a(rawTemp, outFile)
+            if (!ok || !outFile.exists()) {
+                rawTemp.copyTo(outFile, overwrite = true)
+            }
+            DiagnosticLogger.log("DUB-IMPORT", "✅ Загружен пользовательский файл озвучки: ${outFile.name} (${outFile.length() / 1024} KB)")
+            outFile
+        } finally {
+            rawTemp.delete()
+        }
+    }
+
+    private suspend fun trySynthesizeViaGeminiNeuralTts(
+        text: String,
+        voiceProfile: TtsVoiceProfile,
+        apiKey: String
+    ): File? = withContext(Dispatchers.IO) {
+        val payload = buildJsonObject {
+            put(
+                "contents",
+                buildJsonArray {
+                    add(
+                        buildJsonObject {
+                            put(
+                                "parts",
+                                buildJsonArray {
+                                    add(
+                                        buildJsonObject {
+                                            put("text", "Прочитай выразительно и чётко на русском языке для озвучки ролика: $text")
+                                        }
+                                    )
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+            putJsonObject("generationConfig") {
+                put(
+                    "responseModalities",
+                    buildJsonArray {
+                        add(kotlinx.serialization.json.JsonPrimitive("AUDIO"))
+                    }
+                )
+                putJsonObject("speechConfig") {
+                    putJsonObject("voiceConfig") {
+                        putJsonObject("prebuiltVoiceConfig") {
+                            put("voiceName", voiceProfile.geminiVoiceName)
+                        }
+                    }
+                }
+            }
+        }
+
+        val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=$apiKey"
+        val rawResp = httpClient.post(endpoint) {
+            contentType(ContentType.Application.Json)
+            setBody(payload.toString())
+        }.bodyAsText()
+
+        val b64Match = Regex(""""data"\s*:\s*"([A-Za-z0-9+/=\r\n]+)"""")
+            .find(rawResp)?.groupValues?.get(1)
+            ?: return@withContext null
+
+        val pcmBytes = Base64.decode(b64Match.replace("\n", "").replace("\r", ""), Base64.DEFAULT)
+        if (pcmBytes.size < 1000) return@withContext null
+
+        val rawPcmFile = File(stagingDir, "gemini_tts_${System.currentTimeMillis()}.pcm")
+        val outM4aFile = File(stagingDir, "voiceover_gemini_${System.currentTimeMillis()}.m4a")
+        try {
+            rawPcmFile.writeBytes(pcmBytes)
+            val converted = convertRawPcm24kToM4a(rawPcmFile, outM4aFile)
+            if (converted && outM4aFile.exists()) outM4aFile else null
+        } finally {
+            rawPcmFile.delete()
+        }
+    }
+
+    private suspend fun synthesizeViaAndroidSystemTts(
+        text: String,
+        voiceProfile: TtsVoiceProfile
+    ): File? = withTimeoutOrNull(35_000L) {
+        suspendCancellableCoroutine { cont ->
+            val outWav = File(stagingDir, "voiceover_tts_${System.currentTimeMillis()}.wav")
+            var ttsRef: TextToSpeech? = null
+            ttsRef = TextToSpeech(context.applicationContext) { status ->
+                val engine = ttsRef
+                if (status != TextToSpeech.SUCCESS || engine == null) {
+                    if (cont.isActive) cont.resume(null)
+                    return@TextToSpeech
+                }
+                try {
+                    val ruResult = engine.setLanguage(Locale("ru", "RU"))
+                    if (ruResult == TextToSpeech.LANG_MISSING_DATA || ruResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        engine.language = Locale.getDefault()
+                    }
+                    engine.setPitch(voiceProfile.pitch)
+                    engine.setSpeechRate(voiceProfile.rate)
+
+                    val utteranceId = "forge_tts_${System.currentTimeMillis()}"
+                    engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(id: String?) {}
+                        override fun onDone(id: String?) {
+                            try {
+                                engine.shutdown()
+                            } catch (_: Exception) {
+                            }
+                            if (cont.isActive) cont.resume(outWav)
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(id: String?) {
+                            try {
+                                engine.shutdown()
+                            } catch (_: Exception) {
+                            }
+                            if (cont.isActive) cont.resume(null)
+                        }
+                    })
+
+                    val params = Bundle()
+                    val res = engine.synthesizeToFile(text, params, outWav, utteranceId)
+                    if (res != TextToSpeech.SUCCESS) {
+                        engine.shutdown()
+                        if (cont.isActive) cont.resume(null)
+                    }
+                } catch (e: Exception) {
+                    try {
+                        engine.shutdown()
+                    } catch (_: Exception) {
+                    }
+                    if (cont.isActive) cont.resume(null)
+                }
+            }
+        }
+    }
+
+    private suspend fun extractSliceM4aAudio(
+        inputVideo: File,
+        startSec: Double,
+        durationSec: Double,
+        outputM4a: File
+    ): Boolean = suspendCancellableCoroutine { cont ->
+        val cmd = buildString {
+            append("-hide_banner -loglevel error -nostdin -y ")
+            if (startSec > 0.0) {
+                append(String.format(Locale.US, "-ss %.2f ", startSec))
+            }
+            append(String.format(Locale.US, "-t %.2f ", durationSec.coerceIn(3.0, 90.0)))
+            append("-i \"${inputVideo.absolutePath}\" ")
+            append("-vn -ac 1 -ar 16000 -c:a aac -b:a 32k ")
+            append("\"${outputM4a.absolutePath}\"")
+        }
+        FFmpegKit.executeAsync(cmd) { session ->
+            if (cont.isActive) cont.resume(ReturnCode.isSuccess(session.returnCode))
+        }
+    }
+
+    private suspend fun convertRawPcm24kToM4a(rawPcm: File, outM4a: File): Boolean =
+        suspendCancellableCoroutine { cont ->
+            val cmd = buildString {
+                append("-hide_banner -loglevel error -nostdin -y ")
+                append("-f s16le -ar 24000 -ac 1 -i \"${rawPcm.absolutePath}\" ")
+                append("-c:a aac -b:a 192k -ar 48000 ")
+                append("\"${outM4a.absolutePath}\"")
+            }
+            FFmpegKit.executeAsync(cmd) { session ->
+                if (cont.isActive) cont.resume(ReturnCode.isSuccess(session.returnCode))
+            }
+        }
+
+    private suspend fun convertAudioToNormalizedM4a(inputAudio: File, outM4a: File): Boolean =
+        suspendCancellableCoroutine { cont ->
+            val cmd = buildString {
+                append("-hide_banner -loglevel error -nostdin -y ")
+                append("-i \"${inputAudio.absolutePath}\" ")
+                append("-vn -c:a aac -b:a 192k -ar 48000 ")
+                append("\"${outM4a.absolutePath}\"")
+            }
+            FFmpegKit.executeAsync(cmd) { session ->
+                if (cont.isActive) cont.resume(ReturnCode.isSuccess(session.returnCode))
+            }
+        }
+
+    /**
+     * AI-Shazam & Music Matcher:
+     * Слушает выделенную музыкальную дорожку (`musicStemFile`), определяет трек/жанр/инструменты/BPM/настроение
+     * и находит на YouTube похожие инструментальные мелодии без АП (Royalty-Free / No Copyright) под этот же вайб.
+     */
+    suspend fun analyzeMusicStemAndFindSimilar(
+        musicStemFile: File,
+        videoTitle: String
+    ): MusicShazamMatchResult = withContext(Dispatchers.IO) {
+        val apiKey = configStore.getGeminiApiKey()
+        var detectedTrackAndGenre = "Фоновый инструментал (Ambient / Lo-Fi / Electronic)"
+        var moodAndBpm = "Атмосферный ритм ~105 BPM"
+        val searchQueries = mutableListOf<String>()
+
+        if (apiKey.isNotBlank() && musicStemFile.exists() && musicStemFile.length() > 1000L) {
+            val compactSlice = File(stagingDir, "shazam_probe_${System.currentTimeMillis()}.m4a")
+            try {
+                // Compress up to 25s of the isolated music stem for fast Gemini 2.5 Flash audio analysis
+                extractSliceM4aAudio(musicStemFile, 0.0, 25.0, compactSlice)
+                val targetFile = if (compactSlice.exists() && compactSlice.length() > 500L) compactSlice else musicStemFile
+                val base64Audio = Base64.encodeToString(targetFile.readBytes(), Base64.NO_WRAP)
+
+                val prompt = """
+                    Ты — музыкальный эксперт и AI-Shazam. Прослушай эту выделенную музыкальную дорожку из видео «$videoTitle».
+                    1) Если узнаёшь конкретный трек/мелодию — назови её и укажи точный жанр и инструменты (пианино, синтезатор, гитара, фонк, лоу-фай, оркестр, эмбиент и т.д.).
+                    2) Укажи настроение, темп (BPM) и характер звучания.
+                    3) Придумай 3 поисковых запроса на английском языке для поиска максимально похожей инструментальной мелодии без авторских прав (no copyright instrumental background music) точно такого же настроения, темпа и инструментов.
+                    
+                    Верни СТРОГО в таком формате (без лишнего текста):
+                    TRACK_GENRE: <название трека если известен, жанр и инструменты на русском>
+                    MOOD_BPM: <настроение и примерный BPM на русском>
+                    QUERY: <поисковый запрос 1 на английском + no copyright instrumental>
+                    QUERY: <поисковый запрос 2 на английском + royalty free music>
+                    QUERY: <поисковый запрос 3 на английском + background beat instrumental>
+                """.trimIndent()
+
+                val payload = buildJsonObject {
+                    put(
+                        "contents",
+                        buildJsonArray {
+                            add(
+                                buildJsonObject {
+                                    put(
+                                        "parts",
+                                        buildJsonArray {
+                                            add(
+                                                buildJsonObject {
+                                                    putJsonObject("inlineData") {
+                                                        put("mimeType", "audio/mp4")
+                                                        put("data", base64Audio)
+                                                    }
+                                                }
+                                            )
+                                            add(
+                                                buildJsonObject {
+                                                    put("text", prompt)
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                            )
+                        }
+                    )
+                }
+
+                DiagnosticLogger.log("AI-SHAZAM", "🔎 Отправка музыкальной дорожки в Gemini 2.5 Flash для распознавания мелодии и жанра...")
+                val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+                val rawResp = httpClient.post(endpoint) {
+                    contentType(ContentType.Application.Json)
+                    setBody(payload.toString())
+                }.body<GeminiResponse>()
+
+                val text = rawResp.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text.orEmpty()
+                for (line in text.lines()) {
+                    val trimmed = line.trim()
+                    when {
+                        trimmed.startsWith("TRACK_GENRE:", ignoreCase = true) -> {
+                            detectedTrackAndGenre = trimmed.substringAfter(":").trim().ifBlank { detectedTrackAndGenre }
+                        }
+                        trimmed.startsWith("MOOD_BPM:", ignoreCase = true) -> {
+                            moodAndBpm = trimmed.substringAfter(":").trim().ifBlank { moodAndBpm }
+                        }
+                        trimmed.startsWith("QUERY:", ignoreCase = true) -> {
+                            val q = trimmed.substringAfter(":").trim()
+                            if (q.length >= 5) searchQueries.add(q)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                DiagnosticLogger.logError("AI-SHAZAM", "Ошибка анализа мелодии через Gemini", e)
+            } finally {
+                compactSlice.delete()
+            }
+        }
+
+        if (searchQueries.isEmpty()) {
+            val lower = videoTitle.lowercase(Locale.getDefault())
+            when {
+                lower.contains("мото") || lower.contains("дрифт") || lower.contains("авто") || lower.contains("car") || lower.contains("bike") -> {
+                    detectedTrackAndGenre = "Драйвовый электронный бит / Melodic Phonk / Synthwave"
+                    moodAndBpm = "Динамичный ночной драйв ~120 BPM"
+                    searchQueries.add("melodic atmospheric synthwave phonk instrumental no copyright")
+                    searchQueries.add("night drive electronic beat royalty free instrumental")
+                }
+                lower.contains("истори") || lower.contains("факт") || lower.contains("тайна") || lower.contains("космос") -> {
+                    detectedTrackAndGenre = "Кинематографическое пианино и мягкий эмбиент-пад"
+                    moodAndBpm = "Загадочный, глубокий, атмосферный ~90 BPM"
+                    searchQueries.add("cinematic mystery ambient piano instrumental no copyright")
+                    searchQueries.add("dark ambient documentary background music royalty free")
+                }
+                else -> {
+                    detectedTrackAndGenre = "Приятный Chill Lo-Fi / Acoustic Lounge инструментал"
+                    moodAndBpm = "Спокойный, тёплый фоновый грув ~95 BPM"
+                    searchQueries.add("chill lofi aesthetic instrumental beat no copyright")
+                    searchQueries.add("pleasant warm acoustic ambient background music royalty free")
+                }
+            }
+        }
+
+        DiagnosticLogger.log(
+            "AI-SHAZAM",
+            "✅ Распознано: $detectedTrackAndGenre ($moodAndBpm). Поиск похожих мелодий: ${searchQueries.joinToString(" | ")}"
+        )
+
+        val candidates = mutableListOf<Pair<String, String>>()
+        for (query in searchQueries.take(2)) {
+            if (candidates.size >= 6) break
+            try {
+                val request = YoutubeDLRequest("ytsearch6:$query").apply {
+                    addOption("--flat-playlist")
+                    addOption("--dump-json")
+                    addOption("--no-warnings")
+                    addOption("--socket-timeout", "15")
+                }
+                val response = YoutubeDL.getInstance().execute(request)
+                for (line in response.out.lines()) {
+                    val trimmed = line.trim()
+                    if (!trimmed.startsWith("{")) continue
+                    val id = Regex(""""id"\s*:\s*"([^"]+)"""").find(trimmed)?.groupValues?.get(1) ?: continue
+                    val title = Regex(""""title"\s*:\s*"([^"]+)"""").find(trimmed)?.groupValues?.get(1) ?: "Similar Instrumental Track"
+                    val dur = Regex(""""duration"\s*:\s*([0-9.]+)""").find(trimmed)?.groupValues?.get(1)?.toDoubleOrNull() ?: 90.0
+                    if (dur in 20.0..360.0) {
+                        val url = "https://www.youtube.com/watch?v=$id"
+                        if (candidates.none { it.first == url }) {
+                            candidates.add(url to title)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Similar music search failed for '$query': ${e.message}")
+            }
+        }
+
+        MusicShazamMatchResult(
+            detectedTrackAndGenre = detectedTrackAndGenre,
+            moodAndBpm = moodAndBpm,
+            searchQueries = searchQueries,
+            candidateTracks = candidates
+        )
+    }
+
+    /**
+     * Скачивает выбранную похожую мелодию и нормализует её в чистый `.m4a` (48kHz stereo) для подмены музыкальной дорожки.
+     */
+    suspend fun downloadReplacementMusicCandidate(
+        sourceUrl: String,
+        trackTitle: String = "SimilarMelody"
+    ): File = withContext(Dispatchers.IO) {
+        val stamp = System.currentTimeMillis()
+        val rawDownload = File(stagingDir, "bgm_raw_$stamp.m4a")
+        val finalM4a = File(stagingDir, "bgm_replace_$stamp.m4a")
+
+        DiagnosticLogger.log("AI-SHAZAM", "⬇️ Скачиваю похожую мелодию для подмены: «$trackTitle» ($sourceUrl)...")
+
+        val req = YoutubeDLRequest(sourceUrl).apply {
+            addOption("--no-playlist")
+            addOption("-f", "bestaudio[ext=m4a]/bestaudio/best")
+            addOption("--download-sections", "*0-95")
+            addOption("--socket-timeout", "20")
+            addOption("-o", rawDownload.absolutePath)
+        }
+        YoutubeDL.getInstance().execute(req)
+
+        val actualDownloaded = stagingDir.listFiles()?.firstOrNull {
+            it.name.startsWith("bgm_raw_$stamp") && it.length() > 5_000L
+        } ?: throw IllegalStateException("Не удалось скачать аудиопоток мелодии")
+
+        try {
+            val ok = convertAudioToNormalizedM4a(actualDownloaded, finalM4a)
+            if (!ok || !finalM4a.exists() || finalM4a.length() < 2_000L) {
+                throw IllegalStateException("Ошибка нормализации новой мелодии в AAC")
+            }
+            DiagnosticLogger.log("AI-SHAZAM", "✅ Новая мелодия готова к подмене: ${finalM4a.name} (${finalM4a.length() / 1024} KB)")
+            finalM4a
+        } finally {
+            actualDownloaded.delete()
+        }
     }
 }
