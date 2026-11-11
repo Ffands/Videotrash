@@ -20,8 +20,12 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Configure Android SDK 34 (Direct sdkmanager without legacy 'tools' package)
+        run: |
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | sort -V | tail -n 1)
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Download FFmpegKit Full-GPL 6.0-2.LTS AAR (Option 1B Verified Mirror)
         run: |
@@ -31,10 +35,10 @@ jobs:
             "https://github.com/BLAM-PTY-LTD/ffmpeg-kit-binaries/releases/download/v6.0.2/ffmpeg-kit-full-gpl.aar"
           ls -lh app/libs/ffmpeg-kit-full-gpl-6.0-2.LTS.aar
 
-      - name: Setup Gradle 8.9
+      - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.7'
 
       - name: Build Release APK (ARM64-v8a Self-Contained)
         env:

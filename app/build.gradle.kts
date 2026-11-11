@@ -76,14 +76,14 @@ android {
 dependencies {
     val ktorVersion = "2.3.12"
     val coroutinesVersion = "1.8.1"
-    val workVersion = "2.9.1"
+    val workVersion = "2.9.0"
 
-    // Core AndroidX & Lifecycle Service
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.activity:activity-ktx:1.9.3")
-    implementation("androidx.lifecycle:lifecycle-service:2.8.6")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+    // Core AndroidX & Lifecycle Service (Pinned to API 34 compatible releases)
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.appcompat:appcompat:1.6.1")
+    implementation("androidx.activity:activity-ktx:1.8.2")
+    implementation("androidx.lifecycle:lifecycle-service:2.7.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("androidx.work:work-runtime-ktx:$workVersion")
 
     // Coroutines
@@ -111,5 +111,5 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
 
     // Kotlinx Serialization
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 }
