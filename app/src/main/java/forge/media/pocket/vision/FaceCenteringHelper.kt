@@ -79,6 +79,34 @@ sealed class UpperBoxFramingPlan {
             get() = false
     }
 
+    data class ReplacedExistingSplit(
+        val cropWidth: Int,
+        val cropHeight: Int,
+        val cropX: Int,
+        val cropY: Int,
+        val seamPercent: Int,
+        val keptTopHalf: Boolean,
+        val speakerCount: Int
+    ) : UpperBoxFramingPlan() {
+        override val ffmpegVideoFilter: String
+            get() = "crop=${cropWidth}:${cropHeight}:${cropX}:${cropY}," +
+                "scale=1080:960:force_original_aspect_ratio=increase:flags=lanczos," +
+                "crop=1080:960:(iw-1080)/2:(ih-960)/2,setsar=1"
+
+        override val summary: String
+            get() {
+                val actionDesc = if (keptTopHalf) {
+                    "верх оставлен, старый низ заменён"
+                } else {
+                    "низ со спикером поднят, старый верх заменён"
+                }
+                return "Авто-замена 50/50 (шов ${seamPercent}%: $actionDesc)"
+            }
+
+        override val hasBottomFaceRisk: Boolean
+            get() = true
+    }
+
     data object UncroppedFullFrame : UpperBoxFramingPlan() {
         override val ffmpegVideoFilter: String
             get() = "scale=1080:960:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:960:(ow-iw)/2:(oh-ih)/2:color=#101014,setsar=1"
@@ -120,6 +148,14 @@ class FaceCenteringHelper(private val context: Context) {
         val maxRightNorm: Double
     )
 
+    private data class DetectedSplitSeam(
+        val detected: Boolean,
+        val seamYNorm: Double = 0.50,
+        val cleanTopLimitNorm: Double = 0.485,
+        val cleanBottomStartNorm: Double = 0.515,
+        val confidencePct: Int = 0
+    )
+
     suspend fun computeFramingPlan(
         videoFile: File,
         enableSmartFaceCrop: Boolean = true,
@@ -127,40 +163,34 @@ class FaceCenteringHelper(private val context: Context) {
         hardsubRegion: DetectedHardsubRegion? = null,
         hardsubRemovalMode: ExistingSubtitleRemovalMode = ExistingSubtitleRemovalMode.OFF
     ): UpperBoxFramingPlan = withContext(Dispatchers.IO) {
-        if (!enableSmartFaceCrop && hardsubRemovalMode != ExistingSubtitleRemovalMode.AUTO_CROP_ABOVE_SUBS) {
-            return@withContext UpperBoxFramingPlan.UncroppedFullFrame
-        }
-
         val (srcWidth, srcHeight) = probeVideoDimensions(videoFile)
 
         // Safe ceiling Y (in pixels) if we want to crop strictly above burned-in lower subtitles
         val safeMaxBottomPx = if (hardsubRemovalMode == ExistingSubtitleRemovalMode.AUTO_CROP_ABOVE_SUBS &&
             hardsubRegion?.detected == true &&
-            hardsubRegion.yNorm in 0.48..0.94
+            hardsubRegion.yNorm in 0.42..0.94
         ) {
-            ((hardsubRegion.yNorm - 0.02).coerceAtLeast(0.45) * srcHeight).roundToInt().let { it - (it % 2) }
+            ((hardsubRegion.yNorm - 0.02).coerceAtLeast(0.38) * srcHeight).roundToInt().let { it - (it % 2) }
         } else {
             srcHeight
         }
 
-        // If the source is ALREADY vertical (e.g. 1080x1920 YouTube Short), crop a 9:8 window vertically without squashing!
+        // Vertical source (e.g. 1080x1920 Short / Reel):
+        // ALWAYS inspect for an existing 50/50 split boundary so we automatically cut off the old background half
+        // and replace it with our own background reel (even if smart face crop is toggled off).
         if (srcHeight > srcWidth) {
-            val cropW = srcWidth - (srcWidth % 2)
-            val maxAllowedH = safeMaxBottomPx.coerceAtLeast((srcWidth * 0.55).roundToInt())
-            val cropH = ((srcWidth / TARGET_ASPECT).roundToInt().coerceAtMost(maxAllowedH)).let { it - (it % 2) }
-            val defaultCropY = if (safeMaxBottomPx < srcHeight) {
-                // Shift window upward so its bottom edge stays above the burned-in subtitles
-                ((safeMaxBottomPx - cropH).coerceAtLeast(0)).let { it - (it % 2) }
-            } else {
-                (((srcHeight - cropH) * 0.35).roundToInt().coerceIn(0, srcHeight - cropH)).let { it - (it % 2) }
-            }
-            return@withContext UpperBoxFramingPlan.TightCrop(
-                cropWidth = cropW,
-                cropHeight = cropH,
-                cropX = 0,
-                cropY = defaultCropY,
-                speakerCount = 1
+            return@withContext computeVerticalSourceFramingPlan(
+                videoFile = videoFile,
+                srcWidth = srcWidth,
+                srcHeight = srcHeight,
+                safeMaxBottomPx = safeMaxBottomPx,
+                enableSmartFaceCrop = enableSmartFaceCrop,
+                maxSampleSeconds = maxSampleSeconds.coerceIn(6, 20)
             )
+        }
+
+        if (!enableSmartFaceCrop && hardsubRemovalMode != ExistingSubtitleRemovalMode.AUTO_CROP_ABOVE_SUBS) {
+            return@withContext UpperBoxFramingPlan.UncroppedFullFrame
         }
 
         val effectiveSrcHeight = safeMaxBottomPx.coerceIn((srcHeight * 0.62).roundToInt(), srcHeight)
@@ -189,58 +219,7 @@ class FaceCenteringHelper(private val context: Context) {
                 )
             }
 
-            val observations = mutableListOf<FrameFaceObservation>()
-
-            for (frameFile in extractedFrames) {
-                val bitmap = BitmapFactory.decodeFile(frameFile.absolutePath) ?: continue
-                val bmpW = bitmap.width.toDouble()
-                val bmpH = bitmap.height.toDouble()
-
-                try {
-                    val inputImage = InputImage.fromBitmap(bitmap, 0)
-                    val faces = detector.process(inputImage).await()
-
-                    val validFaces = faces.filter { face ->
-                        val areaRatio = (face.boundingBox.width() * face.boundingBox.height()) / (bmpW * bmpH)
-                        areaRatio >= 0.012
-                    }
-
-                    if (validFaces.isNotEmpty()) {
-                        val dominant = validFaces.maxByOrNull {
-                            it.boundingBox.width() * it.boundingBox.height()
-                        }!!
-
-                        val activeSpeakers = validFaces.filter {
-                            val domArea = dominant.boundingBox.width() * dominant.boundingBox.height()
-                            val curArea = it.boundingBox.width() * it.boundingBox.height()
-                            curArea >= domArea * 0.35
-                        }
-
-                        val minLeft = activeSpeakers.minOf {
-                            (it.boundingBox.left.toDouble() / bmpW).coerceIn(0.0, 1.0)
-                        }
-                        val maxRight = activeSpeakers.maxOf {
-                            (it.boundingBox.right.toDouble() / bmpW).coerceIn(0.0, 1.0)
-                        }
-                        val domCenterXNorm =
-                            (dominant.boundingBox.centerX().toDouble() / bmpW).coerceIn(0.0, 1.0)
-                        val domCenterYNorm =
-                            (dominant.boundingBox.centerY().toDouble() / bmpH).coerceIn(0.0, 1.0)
-
-                        observations.add(
-                            FrameFaceObservation(
-                                faceCount = activeSpeakers.size,
-                                primaryCenterXNorm = domCenterXNorm,
-                                primaryCenterYNorm = domCenterYNorm,
-                                minLeftNorm = minLeft,
-                                maxRightNorm = maxRight
-                            )
-                        )
-                    }
-                } finally {
-                    bitmap.recycle()
-                }
-            }
+            val observations = collectFaceObservationsFromFiles(extractedFrames)
 
             if (observations.isEmpty()) {
                 return@withContext UpperBoxFramingPlan.TightCrop(
@@ -313,6 +292,435 @@ class FaceCenteringHelper(private val context: Context) {
             )
         } finally {
             framesDir.deleteRecursively()
+        }
+    }
+
+    /**
+     * Анализирует уже вертикальный исходник (например, 1080x1920 YouTube Short):
+     * 1) Ищет горизонтальную границу (шов) существующего сплита 50/50 (в диапазоне 34%..66% высоты).
+     * 2) Если ролик УЖЕ склеен из двух половин — определяет, в какой половине находится спикер/контент
+     *    (обычно сверху, но если лицо снизу — поднимает нижнюю половину!), чисто отрезает старую залипалку
+     *    выше/ниже шва с защитным отступом и подготавливает верхний блок 1080x960 под замену фона.
+     * 3) Если ролик цельный (не 50/50) — центрует окно 9:8 по лицу спикера через ML Kit.
+     */
+    private suspend fun computeVerticalSourceFramingPlan(
+        videoFile: File,
+        srcWidth: Int,
+        srcHeight: Int,
+        safeMaxBottomPx: Int,
+        enableSmartFaceCrop: Boolean,
+        maxSampleSeconds: Int
+    ): UpperBoxFramingPlan {
+        val evenSrcW = (srcWidth - (srcWidth % 2)).coerceAtLeast(2)
+        val idealBoxH = ((evenSrcW / TARGET_ASPECT).roundToInt()).let { it - (it % 2) }.coerceIn(2, srcHeight)
+
+        val framesDir = File(context.cacheDir, "vsplit_samples_${System.currentTimeMillis()}").apply { mkdirs() }
+        try {
+            val frameFiles = extractBatchThumbnails1Fps(
+                videoFile = videoFile,
+                outputDir = framesDir,
+                maxDurationSec = maxSampleSeconds
+            )
+
+            val bitmaps = frameFiles.take(10).mapNotNull { BitmapFactory.decodeFile(it.absolutePath) }
+            val splitSeam = if (bitmaps.size >= 2) {
+                detectVerticalSplitSeam(bitmaps)
+            } else {
+                DetectedSplitSeam(detected = false)
+            }
+
+            val faceObservations = if (bitmaps.isNotEmpty()) {
+                collectFaceObservationsFromBitmaps(bitmaps)
+            } else {
+                emptyList()
+            }
+            bitmaps.forEach { it.recycle() }
+
+            if (splitSeam.detected) {
+                val seamPct = (splitSeam.seamYNorm * 100.0).roundToInt()
+                val topFaces = faceObservations.filter { it.primaryCenterYNorm < splitSeam.seamYNorm - 0.03 }
+                val bottomFaces = faceObservations.filter { it.primaryCenterYNorm > splitSeam.seamYNorm + 0.03 }
+
+                // Keep top half by default; only switch to bottom half if speakers clearly live in the bottom half
+                val keepTopHalf = !(bottomFaces.size >= 2 && topFaces.isEmpty())
+                val activeFaces = if (keepTopHalf) topFaces else bottomFaces
+
+                val halfStartPx: Int
+                val halfEndPx: Int
+                if (keepTopHalf) {
+                    halfStartPx = 0
+                    val rawSeamLimit = (splitSeam.cleanTopLimitNorm * srcHeight).roundToInt()
+                    halfEndPx = rawSeamLimit.coerceAtMost(safeMaxBottomPx).coerceIn((srcHeight * 0.30).roundToInt(), srcHeight)
+                } else {
+                    halfStartPx = (splitSeam.cleanBottomStartNorm * srcHeight).roundToInt()
+                        .coerceIn(0, (srcHeight * 0.70).roundToInt())
+                        .let { it + (it % 2) }
+                    halfEndPx = srcHeight
+                }
+
+                val availableHalfH = ((halfEndPx - halfStartPx).let { it - (it % 2) }).coerceAtLeast(120)
+
+                // Fit cleanly inside the isolated half so ZERO pixels from the other half ever leak
+                val finalCropH: Int
+                val finalCropW: Int
+                val finalCropX: Int
+                val finalCropY: Int
+
+                if (availableHalfH >= idealBoxH) {
+                    finalCropW = evenSrcW
+                    finalCropH = idealBoxH
+                    finalCropX = 0
+                    finalCropY = if (enableSmartFaceCrop && activeFaces.isNotEmpty()) {
+                        val medianFaceY = median(activeFaces.map { it.primaryCenterYNorm }) * srcHeight
+                        val desiredTop = (medianFaceY - finalCropH * 0.42).roundToInt()
+                        desiredTop.coerceIn(halfStartPx, halfEndPx - finalCropH).let { it - (it % 2) }
+                    } else if (keepTopHalf) {
+                        // Anchor slightly above the seam or centered in top half, never crossing halfEndPx
+                        ((halfEndPx - finalCropH) / 2).coerceIn(halfStartPx, halfEndPx - finalCropH).let { it - (it % 2) }
+                    } else {
+                        halfStartPx
+                    }
+                } else {
+                    // Half is shorter than 9:8 (e.g. 42%/58% split or cropped above seam subtitles):
+                    // take full height of the clean half and match 9:8 aspect horizontally centered on speaker!
+                    finalCropH = availableHalfH
+                    finalCropW = ((finalCropH * TARGET_ASPECT).roundToInt().coerceIn(120, evenSrcW)).let { it - (it % 2) }
+                    finalCropY = halfStartPx
+                    finalCropX = if (enableSmartFaceCrop && activeFaces.isNotEmpty()) {
+                        val medianFaceX = median(activeFaces.map { it.primaryCenterXNorm }) * srcWidth
+                        (medianFaceX - finalCropW / 2.0).roundToInt()
+                            .coerceIn(0, (srcWidth - finalCropW).coerceAtLeast(0))
+                            .let { it - (it % 2) }
+                    } else {
+                        (((srcWidth - finalCropW) / 2).coerceAtLeast(0)).let { it - (it % 2) }
+                    }
+                }
+
+                DiagnosticLogger.log(
+                    "SPLIT-DETECT",
+                    "✂️ Обнаружен готовый сплит в исходнике! Граница Y=${seamPct}% (точность ${splitSeam.confidencePct}%), " +
+                        "keepTop=$keepTopHalf -> чистый кроп ${finalCropW}x${finalCropH} (x=$finalCropX, y=$finalCropY), старый фон отрезан!"
+                )
+
+                return UpperBoxFramingPlan.ReplacedExistingSplit(
+                    cropWidth = finalCropW,
+                    cropHeight = finalCropH,
+                    cropX = finalCropX,
+                    cropY = finalCropY,
+                    seamPercent = seamPct,
+                    keptTopHalf = keepTopHalf,
+                    speakerCount = activeFaces.maxOfOrNull { it.faceCount } ?: 1
+                )
+            }
+
+            // Not a pre-split video: regular full-screen vertical Short -> frame 9:8 window on speaker's face
+            val maxAllowedH = safeMaxBottomPx.coerceAtLeast((srcWidth * 0.55).roundToInt())
+            val cropH = idealBoxH.coerceAtMost(maxAllowedH).let { it - (it % 2) }
+            val cropW = ((cropH * TARGET_ASPECT).roundToInt().coerceAtMost(evenSrcW)).let { it - (it % 2) }
+            val cropX = if (enableSmartFaceCrop && faceObservations.isNotEmpty() && cropW < evenSrcW) {
+                val medianFaceX = median(faceObservations.map { it.primaryCenterXNorm }) * srcWidth
+                (medianFaceX - cropW / 2.0).roundToInt().coerceIn(0, srcWidth - cropW).let { it - (it % 2) }
+            } else {
+                (((srcWidth - cropW) / 2).coerceAtLeast(0)).let { it - (it % 2) }
+            }
+
+            val maxCropY = (safeMaxBottomPx - cropH).coerceIn(0, (srcHeight - cropH).coerceAtLeast(0))
+            val cropY = when {
+                enableSmartFaceCrop && faceObservations.isNotEmpty() -> {
+                    val medianFaceY = median(faceObservations.map { it.primaryCenterYNorm }) * srcHeight
+                    // Place speaker's face at ~40% from the top of the upper box so forehead & shoulders fit naturally
+                    (medianFaceY - cropH * 0.40).roundToInt().coerceIn(0, maxCropY).let { it - (it % 2) }
+                }
+                safeMaxBottomPx < srcHeight -> {
+                    maxCropY - (maxCropY % 2)
+                }
+                else -> {
+                    (((srcHeight - cropH) * 0.28).roundToInt().coerceIn(0, maxCropY)).let { it - (it % 2) }
+                }
+            }
+
+            DiagnosticLogger.log(
+                "SPLIT-DETECT",
+                "Вертикальный исходник цельный (шва 50/50 нет) -> выбран кроп спикера ${cropW}x${cropH} (y=$cropY, лиц=${faceObservations.size})"
+            )
+
+            return UpperBoxFramingPlan.TightCrop(
+                cropWidth = cropW,
+                cropHeight = cropH,
+                cropX = cropX,
+                cropY = cropY,
+                speakerCount = if (faceObservations.isNotEmpty()) 1 else 0
+            )
+        } finally {
+            framesDir.deleteRecursively()
+        }
+    }
+
+    /**
+     * Детектор горизонтальной границы сплита (50/50, 45/55, 40/60 и т.д.) по серии кадров:
+     * Ищет строку Y (34%..66% высоты), где на протяжении всего видео держится стационарный горизонтальный
+     * разрыв между двумя разными видеорядами ИЛИ разделительная полоса/плашка.
+     */
+    private fun detectVerticalSplitSeam(bitmaps: List<android.graphics.Bitmap>): DetectedSplitSeam {
+        if (bitmaps.size < 2) return DetectedSplitSeam(detected = false)
+        val w = bitmaps.first().width
+        val h = bitmaps.first().height
+        if (w < 120 || h < 200) return DetectedSplitSeam(detected = false)
+
+        val yScanStart = (h * 0.34).roundToInt().coerceAtLeast(8)
+        val yScanEnd = (h * 0.66).roundToInt().coerceAtMost(h - 9)
+        val xStart = (w * 0.06).roundToInt().coerceAtLeast(2)
+        val xEnd = (w * 0.94).roundToInt().coerceAtMost(w - 3)
+        val sampleCols = ((xEnd - xStart) / 3).coerceAtLeast(1)
+
+        val rowMeanEdgeCoverage = DoubleArray(h)
+        val rowPersistentFrameRatio = DoubleArray(h)
+        val rowFlatBarRatio = DoubleArray(h)
+
+        for (y in (yScanStart - 6)..(yScanEnd + 6)) {
+            if (y < 4 || y >= h - 4) continue
+            var sumCoverage = 0.0
+            var strongFrames = 0
+            var flatBarFrames = 0
+
+            for (bmp in bitmaps) {
+                var edgeHits = 0
+                var lumSum = 0.0
+                var lumSqSum = 0.0
+                var count = 0
+
+                var x = xStart
+                while (x < xEnd) {
+                    val cAbove = bmp.getPixel(x, y - 2)
+                    val cBelow = bmp.getPixel(x, y + 2)
+                    val diff2 = (
+                        abs(Color.red(cAbove) - Color.red(cBelow)) +
+                            abs(Color.green(cAbove) - Color.green(cBelow)) +
+                            abs(Color.blue(cAbove) - Color.blue(cBelow))
+                        ) / 3
+
+                    val cAbove3 = bmp.getPixel(x, y - 3)
+                    val cBelow3 = bmp.getPixel(x, y + 3)
+                    val diff3 = (
+                        abs(Color.red(cAbove3) - Color.red(cBelow3)) +
+                            abs(Color.green(cAbove3) - Color.green(cBelow3)) +
+                            abs(Color.blue(cAbove3) - Color.blue(cBelow3))
+                        ) / 3
+
+                    if (maxOf(diff2, diff3) >= 20) {
+                        edgeHits++
+                    }
+
+                    val cMid = bmp.getPixel(x, y)
+                    val lum = (Color.red(cMid) * 299 + Color.green(cMid) * 587 + Color.blue(cMid) * 114) / 1000.0
+                    lumSum += lum
+                    lumSqSum += lum * lum
+                    count++
+                    x += 3
+                }
+
+                val coverage = edgeHits.toDouble() / sampleCols.toDouble()
+                sumCoverage += coverage
+                if (coverage >= 0.48) {
+                    strongFrames++
+                }
+
+                if (count > 4) {
+                    val meanLum = lumSum / count
+                    val variance = (lumSqSum / count) - (meanLum * meanLum)
+                    if (variance <= 140.0) {
+                        flatBarFrames++
+                    }
+                }
+            }
+
+            rowMeanEdgeCoverage[y] = sumCoverage / bitmaps.size.toDouble()
+            rowPersistentFrameRatio[y] = strongFrames.toDouble() / bitmaps.size.toDouble()
+            rowFlatBarRatio[y] = flatBarFrames.toDouble() / bitmaps.size.toDouble()
+        }
+
+        // Find peak seam candidate with high local prominence over neighboring rows (y ± 10..20px)
+        var bestY = -1
+        var bestScore = 0.0
+        var bestProminence = 1.0
+
+        for (y in yScanStart..yScanEnd) {
+            var neighborSum = 0.0
+            var neighborCnt = 0
+            for (dy in listOf(-20, -16, -12, 12, 16, 20)) {
+                val ny = y + dy
+                if (ny in 5 until (h - 5)) {
+                    neighborSum += rowMeanEdgeCoverage[ny]
+                    neighborCnt++
+                }
+            }
+            val neighborAvg = (if (neighborCnt > 0) neighborSum / neighborCnt else 0.18).coerceAtLeast(0.08)
+            val prominence = rowMeanEdgeCoverage[y] / neighborAvg
+
+            // Slight natural prior toward 50/50 center (0.45..0.55) when multiple rows compete
+            val yNorm = y.toDouble() / h.toDouble()
+            val centerBonus = if (yNorm in 0.44..0.56) 1.12 else 1.0
+
+            val compositeScore = rowMeanEdgeCoverage[y] *
+                (0.55 + 0.45 * rowPersistentFrameRatio[y]) *
+                prominence.coerceAtMost(5.0) *
+                centerBonus
+
+            val passesDirectSeam = rowMeanEdgeCoverage[y] >= 0.46 &&
+                rowPersistentFrameRatio[y] >= 0.65 &&
+                prominence >= 1.58
+
+            val passesDividerBar = rowFlatBarRatio[y] >= 0.75 &&
+                (rowMeanEdgeCoverage[(y - 3).coerceAtLeast(4)] >= 0.42 ||
+                    rowMeanEdgeCoverage[(y + 3).coerceAtMost(h - 5)] >= 0.42) &&
+                prominence >= 1.35
+
+            if ((passesDirectSeam || passesDividerBar) && compositeScore > bestScore) {
+                bestScore = compositeScore
+                bestY = y
+                bestProminence = prominence
+            }
+        }
+
+        if (bestY < 0) {
+            return DetectedSplitSeam(detected = false)
+        }
+
+        // Verify the two halves aren't just a uniform static letterbox or single continuous gradient:
+        // check independent motion OR distinct color distribution above vs below bestY
+        var distinctHalfEvidence = 0
+        for (i in 0 until bitmaps.size) {
+            val bmp = bitmaps[i]
+            val nextBmp = bitmaps[(i + 1) % bitmaps.size]
+            var topLum = 0L
+            var botLum = 0L
+            var topMotion = 0L
+            var botMotion = 0L
+            var samples = 0
+
+            val topSampleY1 = (bestY * 0.25).roundToInt().coerceAtLeast(4)
+            val topSampleY2 = (bestY * 0.80).roundToInt().coerceAtLeast(topSampleY1 + 2)
+            val botSampleY1 = (bestY + (h - bestY) * 0.20).roundToInt().coerceAtMost(h - 6)
+            val botSampleY2 = (bestY + (h - bestY) * 0.78).roundToInt().coerceAtLeast(botSampleY1 + 2)
+
+            var sx = xStart
+            while (sx < xEnd) {
+                val ty = (topSampleY1 + topSampleY2) / 2
+                val by = (botSampleY1 + botSampleY2) / 2
+                val tc = bmp.getPixel(sx, ty)
+                val bc = bmp.getPixel(sx, by)
+                val tcNext = nextBmp.getPixel(sx, ty)
+                val bcNext = nextBmp.getPixel(sx, by)
+
+                topLum += (Color.red(tc) + Color.green(tc) + Color.blue(tc)) / 3
+                botLum += (Color.red(bc) + Color.green(bc) + Color.blue(bc)) / 3
+                topMotion += abs(Color.green(tc) - Color.green(tcNext))
+                botMotion += abs(Color.green(bc) - Color.green(bcNext))
+                samples++
+                sx += 6
+            }
+            if (samples > 0) {
+                val lumDiff = abs((topLum / samples) - (botLum / samples))
+                val motionDiff = abs((topMotion / samples) - (botMotion / samples))
+                if (lumDiff >= 12 || motionDiff >= 5 || bestProminence >= 2.15) {
+                    distinctHalfEvidence++
+                }
+            }
+        }
+
+        if (distinctHalfEvidence * 2 < bitmaps.size) {
+            return DetectedSplitSeam(detected = false)
+        }
+
+        // Expand outward across any divider bar / border stroke + 1.5% safety margin so zero seam artifacts remain
+        var cleanTopY = bestY - 2
+        while (cleanTopY > (bestY - (h * 0.045).roundToInt()) &&
+            (rowFlatBarRatio[cleanTopY] >= 0.70 || rowMeanEdgeCoverage[cleanTopY] >= 0.55)
+        ) {
+            cleanTopY--
+        }
+        val safetyPadPx = (h * 0.014).roundToInt().coerceAtLeast(4)
+        cleanTopY = (cleanTopY - safetyPadPx).coerceAtLeast((h * 0.28).roundToInt())
+
+        var cleanBotY = bestY + 2
+        while (cleanBotY < (bestY + (h * 0.045).roundToInt()) &&
+            (rowFlatBarRatio[cleanBotY] >= 0.70 || rowMeanEdgeCoverage[cleanBotY] >= 0.55)
+        ) {
+            cleanBotY++
+        }
+        cleanBotY = (cleanBotY + safetyPadPx).coerceAtMost((h * 0.72).roundToInt())
+
+        val conf = (68 + (bestProminence * 9.0).roundToInt()).coerceIn(72, 99)
+        return DetectedSplitSeam(
+            detected = true,
+            seamYNorm = bestY.toDouble() / h.toDouble(),
+            cleanTopLimitNorm = cleanTopY.toDouble() / h.toDouble(),
+            cleanBottomStartNorm = cleanBotY.toDouble() / h.toDouble(),
+            confidencePct = conf
+        )
+    }
+
+    private suspend fun collectFaceObservationsFromFiles(frameFiles: List<File>): List<FrameFaceObservation> {
+        val observations = mutableListOf<FrameFaceObservation>()
+        for (frameFile in frameFiles) {
+            val bitmap = BitmapFactory.decodeFile(frameFile.absolutePath) ?: continue
+            try {
+                detectFaceInBitmap(bitmap)?.let { observations.add(it) }
+            } finally {
+                bitmap.recycle()
+            }
+        }
+        return observations
+    }
+
+    private suspend fun collectFaceObservationsFromBitmaps(bitmaps: List<android.graphics.Bitmap>): List<FrameFaceObservation> {
+        val observations = mutableListOf<FrameFaceObservation>()
+        for (bitmap in bitmaps) {
+            detectFaceInBitmap(bitmap)?.let { observations.add(it) }
+        }
+        return observations
+    }
+
+    private suspend fun detectFaceInBitmap(bitmap: android.graphics.Bitmap): FrameFaceObservation? {
+        val bmpW = bitmap.width.toDouble()
+        val bmpH = bitmap.height.toDouble()
+        return try {
+            val inputImage = InputImage.fromBitmap(bitmap, 0)
+            val faces = detector.process(inputImage).await()
+            val validFaces = faces.filter { face ->
+                val areaRatio = (face.boundingBox.width() * face.boundingBox.height()) / (bmpW * bmpH)
+                areaRatio >= 0.008
+            }
+            if (validFaces.isEmpty()) return null
+
+            val dominant = validFaces.maxByOrNull {
+                it.boundingBox.width() * it.boundingBox.height()
+            } ?: return null
+
+            val activeSpeakers = validFaces.filter {
+                val domArea = dominant.boundingBox.width() * dominant.boundingBox.height()
+                val curArea = it.boundingBox.width() * it.boundingBox.height()
+                curArea >= domArea * 0.35
+            }
+
+            val minLeft = activeSpeakers.minOf {
+                (it.boundingBox.left.toDouble() / bmpW).coerceIn(0.0, 1.0)
+            }
+            val maxRight = activeSpeakers.maxOf {
+                (it.boundingBox.right.toDouble() / bmpW).coerceIn(0.0, 1.0)
+            }
+            val domCenterXNorm = (dominant.boundingBox.centerX().toDouble() / bmpW).coerceIn(0.0, 1.0)
+            val domCenterYNorm = (dominant.boundingBox.centerY().toDouble() / bmpH).coerceIn(0.0, 1.0)
+
+            FrameFaceObservation(
+                faceCount = activeSpeakers.size,
+                primaryCenterXNorm = domCenterXNorm,
+                primaryCenterYNorm = domCenterYNorm,
+                minLeftNorm = minLeft,
+                maxRightNorm = maxRight
+            )
+        } catch (_: Exception) {
+            null
         }
     }
 

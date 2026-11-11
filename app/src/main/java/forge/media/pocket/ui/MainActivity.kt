@@ -1648,7 +1648,7 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             try {
-                val renderedFile = withContext(Dispatchers.IO) {
+                val (renderedFile, framingSummary) = withContext(Dispatchers.IO) {
                     val spanSec = if (initialConfig.trimEndSec > initialConfig.trimStartSec + 1.0) {
                         initialConfig.trimEndSec - initialConfig.trimStartSec
                     } else {
@@ -1693,7 +1693,7 @@ class MainActivity : AppCompatActivity() {
                         null
                     }
 
-                    hardwareEngine.renderPipeline(
+                    val out = hardwareEngine.renderPipeline(
                         primaryVideoFile = sourceFile,
                         clutterReelFile = clutterFile,
                         framingPlan = framing,
@@ -1701,22 +1701,23 @@ class MainActivity : AppCompatActivity() {
                         config = config,
                         isPreviewPass = isPreviewPass
                     )
+                    out to framing.summary
                 }
 
                 if (isPreviewPass) {
                     val kb = renderedFile.length() / 1024
-                    studioRenderStatusView.text = "✅ 5-сек тест готов ($kb KB)! Воспроизвожу в плеере сверху."
+                    studioRenderStatusView.text = "✅ 5-сек тест готов ($kb KB) • 📐 $framingSummary"
                     playFileInStudioPlayer(renderedFile, "5-сек Тест (${initialConfig.layoutLayer.label})")
                 } else {
                     val savedGalleryFile = hardwareEngine.saveRenderedVideoToGallery(renderedFile, item.title)
                     lastRenderedGalleryFile = savedGalleryFile
                     renderedFile.delete()
                     val mb = String.format(Locale.US, "%.1f", savedGalleryFile.length() / (1024.0 * 1024.0))
-                    studioRenderStatusView.text = "✅ ГОТОВО! Ролик сохранён в Галерею телефона:\nMovies/PocketMediaForge/${savedGalleryFile.name} ($mb МБ)"
+                    studioRenderStatusView.text = "✅ ГОТОВО ($mb МБ) • 📐 $framingSummary\nMovies/PocketMediaForge/${savedGalleryFile.name}"
                     playFileInStudioPlayer(savedGalleryFile, "Готовый Мастер: ${savedGalleryFile.name}")
                     Toast.makeText(
                         this@MainActivity,
-                        "✅ Сохранено в Галерею! Теперь можно загружать на YouTube.",
+                        "✅ Сохранено в Галерею! ($framingSummary)",
                         Toast.LENGTH_LONG
                     ).show()
                 }

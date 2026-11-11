@@ -1279,6 +1279,7 @@ class TelegramBotWorker(
                         )
                         val captionText = buildString {
                             append("✅ Готовый ролик сохранён в Галерею телефона (${galleryFile.name})!\n")
+                            append("📐 Кадр 50/50: ").append(framing.summary).append("\n")
                             if (meta != null && meta.titles.isNotEmpty()) {
                                 append("\n🔥 Идеи названий:\n")
                                 meta.titles.take(3).forEachIndexed { i, t ->

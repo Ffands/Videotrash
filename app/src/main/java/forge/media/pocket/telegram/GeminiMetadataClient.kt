@@ -5,13 +5,14 @@ import forge.media.pocket.compositor.AdInsertionMode
 import forge.media.pocket.compositor.AdLayerConfig
 import forge.media.pocket.config.NodeConfigStore
 import io.ktor.client.HttpClient
-import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
+import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -62,7 +63,6 @@ class GeminiMetadataClient(private val configStore: NodeConfigStore) {
 
     @Serializable
     private data class GeminiGenerationConfig(
-        val temperature: Double = 0.4,
         val responseMimeType: String = "application/json"
     )
 
@@ -126,42 +126,46 @@ class GeminiMetadataClient(private val configStore: NodeConfigStore) {
             }
         """.trimIndent()
 
-        try {
-            val endpoint =
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+        val models = listOf("gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite")
+        for (modelName in models) {
+            try {
+                val endpoint =
+                    "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
 
-            val response: GeminiGenerateResponse = httpClient.post(endpoint) {
-                contentType(ContentType.Application.Json)
-                setBody(
-                    GeminiGenerateRequest(
-                        contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = prompt)))),
-                        generationConfig = GeminiGenerationConfig(
-                            temperature = 0.4,
-                            responseMimeType = "application/json"
+                val httpResp = httpClient.post(endpoint) {
+                    contentType(ContentType.Application.Json)
+                    setBody(
+                        GeminiGenerateRequest(
+                            contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = prompt)))),
+                            generationConfig = GeminiGenerationConfig(
+                                responseMimeType = "application/json"
+                            )
                         )
                     )
-                )
-            }.body()
+                }
+                if (!httpResp.status.isSuccess()) continue
 
-            val rawText = response.candidates.firstOrNull()
-                ?.content?.parts?.firstOrNull()?.text
-                ?.replace("```json", "")
-                ?.replace("```", "")
-                ?.trim()
-                ?: return@withContext null
+                val response = jsonFormat.decodeFromString<GeminiGenerateResponse>(httpResp.bodyAsText())
+                val rawText = response.candidates.firstOrNull()
+                    ?.content?.parts?.firstOrNull()?.text
+                    ?.replace("```json", "")
+                    ?.replace("```", "")
+                    ?.trim()
+                    ?: continue
 
-            val firstBrace = rawText.indexOf('{')
-            val lastBrace = rawText.lastIndexOf('}')
-            val cleanJson = if (firstBrace >= 0 && lastBrace > firstBrace) {
-                rawText.substring(firstBrace, lastBrace + 1)
-            } else {
-                rawText
+                val firstBrace = rawText.indexOf('{')
+                val lastBrace = rawText.lastIndexOf('}')
+                val cleanJson = if (firstBrace >= 0 && lastBrace > firstBrace) {
+                    rawText.substring(firstBrace, lastBrace + 1)
+                } else {
+                    rawText
+                }
+
+                return@withContext jsonFormat.decodeFromString<GeneratedSocialMetadata>(cleanJson)
+            } catch (e: Exception) {
+                Log.w(TAG, "Gemini metadata attempt ($modelName) warning: ${e.message}")
             }
-
-            jsonFormat.decodeFromString<GeneratedSocialMetadata>(cleanJson)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to generate Gemini metadata", e)
-            null
         }
+        null
     }
 }

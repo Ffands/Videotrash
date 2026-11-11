@@ -15,7 +15,6 @@ import forge.media.pocket.config.DiagnosticLogger
 import forge.media.pocket.config.NodeConfigStore
 import forge.media.pocket.vision.UpperBoxFramingPlan
 import io.ktor.client.HttpClient
-import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.post
@@ -23,6 +22,7 @@ import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
+import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -149,7 +149,6 @@ class SubtitleAssTransformer(
 
     @Serializable
     private data class GeminiGenerationConfig(
-        val temperature: Double = 0.1,
         val responseMimeType: String = "application/json"
     )
 
@@ -345,7 +344,7 @@ class SubtitleAssTransformer(
                     return@withContext emptyList()
                 }
 
-                DiagnosticLogger.log("SUBS", "Отправка аудио (${tempAudio.length() / 1024} KB) в Gemini 2.5 Flash для таймкодов...")
+                DiagnosticLogger.log("SUBS", "Отправка аудио (${tempAudio.length() / 1024} KB) в Gemini для таймкодов...")
                 val base64Audio = Base64.encodeToString(tempAudio.readBytes(), Base64.NO_WRAP)
                 val prompt = """
                     Transcribe the speech in this audio into short phrases of 3 to 5 words (keep the original language, e.g. Russian).
@@ -368,27 +367,34 @@ class SubtitleAssTransformer(
                         )
                     ),
                     generationConfig = GeminiGenerationConfig(
-                        temperature = 0.1,
                         responseMimeType = "application/json"
                     )
                 )
 
-                val endpoint =
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+                var rawJson: String? = null
+                val sttModels = listOf("gemini-3.5-transcribe", "gemini-3.8-flash", "gemini-flash-latest")
+                for (modelName in sttModels) {
+                    val endpoint =
+                        "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
+                    val httpResp = httpClient.post(endpoint) {
+                        contentType(ContentType.Application.Json)
+                        setBody(requestPayload)
+                    }
+                    if (!httpResp.status.isSuccess()) continue
+                    val parsedResp = jsonFormat.decodeFromString<GeminiGenerateResponse>(httpResp.bodyAsText())
+                    val text = parsedResp.candidates.firstOrNull()
+                        ?.content?.parts?.firstOrNull()?.text
+                        ?.replace("```json", "")
+                        ?.replace("```", "")
+                        ?.trim()
+                    if (!text.isNullOrBlank()) {
+                        rawJson = text
+                        break
+                    }
+                }
 
-                val response: GeminiGenerateResponse = httpClient.post(endpoint) {
-                    contentType(ContentType.Application.Json)
-                    setBody(requestPayload)
-                }.body()
-
-                val rawJson = response.candidates.firstOrNull()
-                    ?.content?.parts?.firstOrNull()?.text
-                    ?.replace("```json", "")
-                    ?.replace("```", "")
-                    ?.trim()
-                    ?: return@withContext emptyList()
-
-                val segments = jsonFormat.decodeFromString<List<TranscribedSegmentDto>>(rawJson)
+                val cleanRawJson = rawJson ?: return@withContext emptyList()
+                val segments = jsonFormat.decodeFromString<List<TranscribedSegmentDto>>(cleanRawJson)
                 val words = mutableListOf<TimedWord>()
 
                 for (seg in segments) {
@@ -595,21 +601,29 @@ class SubtitleAssTransformer(
             val reqPayload = GeminiGenerateRequest(
                 contents = listOf(GeminiContent(parts = partsList)),
                 generationConfig = GeminiGenerationConfig(
-                    temperature = 0.35,
                     responseMimeType = "text/plain"
                 )
             )
 
-            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
-            val response: GeminiGenerateResponse = httpClient.post(endpoint) {
-                contentType(ContentType.Application.Json)
-                setBody(reqPayload)
-            }.body()
-
-            val generatedScript = response.candidates.firstOrNull()
-                ?.content?.parts?.firstOrNull()?.text
-                ?.trim()
-                .orEmpty()
+            var generatedScript = ""
+            val dubModels = listOf("gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite")
+            for (modelName in dubModels) {
+                val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
+                val httpResp = httpClient.post(endpoint) {
+                    contentType(ContentType.Application.Json)
+                    setBody(reqPayload)
+                }
+                if (!httpResp.status.isSuccess()) continue
+                val response = jsonFormat.decodeFromString<GeminiGenerateResponse>(httpResp.bodyAsText())
+                val candidateText = response.candidates.firstOrNull()
+                    ?.content?.parts?.firstOrNull()?.text
+                    ?.trim()
+                    .orEmpty()
+                if (candidateText.isNotBlank()) {
+                    generatedScript = candidateText
+                    break
+                }
+            }
 
             if (generatedScript.isNotBlank()) {
                 DiagnosticLogger.log("DUB-SCRIPT", "✅ Готов скрипт переозвучки (${generatedScript.length} симв.)")
@@ -678,7 +692,7 @@ class SubtitleAssTransformer(
             try {
                 DiagnosticLogger.log(
                     "DUB-TTS",
-                    "🎙 Генерация нейросетевой озвучки через Gemini 2.5 Flash TTS (голос=${voiceProfile.geminiVoiceName})..."
+                    "🎙 Генерация нейросетевой озвучки через Gemini Neural TTS (голос=${voiceProfile.geminiVoiceName})..."
                 )
                 val geminiFile = trySynthesizeViaGeminiNeuralTts(cleanText, voiceProfile, apiKey)
                 if (geminiFile != null && geminiFile.exists() && geminiFile.length() > 1000L) {
@@ -766,17 +780,26 @@ class SubtitleAssTransformer(
             }
         }
 
-        val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=$apiKey"
-        val rawResp = httpClient.post(endpoint) {
-            contentType(ContentType.Application.Json)
-            setBody(payload.toString())
-        }.bodyAsText()
+        var b64Match: String? = null
+        val ttsModels = listOf("gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts")
+        for (ttsModel in ttsModels) {
+            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$ttsModel:generateContent?key=$apiKey"
+            val httpResp = httpClient.post(endpoint) {
+                contentType(ContentType.Application.Json)
+                setBody(payload.toString())
+            }
+            if (!httpResp.status.isSuccess()) continue
+            val rawResp = httpResp.bodyAsText()
+            val found = Regex(""""data"\s*:\s*"([A-Za-z0-9+/=\r\n]+)"""")
+                .find(rawResp)?.groupValues?.get(1)
+            if (!found.isNullOrBlank()) {
+                b64Match = found
+                break
+            }
+        }
+        val validB64 = b64Match ?: return@withContext null
 
-        val b64Match = Regex(""""data"\s*:\s*"([A-Za-z0-9+/=\r\n]+)"""")
-            .find(rawResp)?.groupValues?.get(1)
-            ?: return@withContext null
-
-        val pcmBytes = Base64.decode(b64Match.replace("\n", "").replace("\r", ""), Base64.DEFAULT)
+        val pcmBytes = Base64.decode(validB64.replace("\n", "").replace("\r", ""), Base64.DEFAULT)
         if (pcmBytes.size < 1000) return@withContext null
 
         val rawPcmFile = File(stagingDir, "gemini_tts_${System.currentTimeMillis()}.pcm")
@@ -962,14 +985,23 @@ class SubtitleAssTransformer(
                     )
                 }
 
-                DiagnosticLogger.log("AI-SHAZAM", "🔎 Отправка музыкальной дорожки в Gemini 2.5 Flash для распознавания мелодии и жанра...")
-                val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
-                val rawResp = httpClient.post(endpoint) {
-                    contentType(ContentType.Application.Json)
-                    setBody(payload.toString())
-                }.body<GeminiGenerateResponse>()
-
-                val text = rawResp.candidates.firstOrNull()?.content?.parts?.firstOrNull()?.text.orEmpty()
+                DiagnosticLogger.log("AI-SHAZAM", "🔎 Отправка музыкальной дорожки в Gemini для распознавания мелодии и жанра...")
+                var text = ""
+                val shazamModels = listOf("gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite")
+                for (modelName in shazamModels) {
+                    val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
+                    val httpResp = httpClient.post(endpoint) {
+                        contentType(ContentType.Application.Json)
+                        setBody(payload.toString())
+                    }
+                    if (!httpResp.status.isSuccess()) continue
+                    val rawResp = jsonFormat.decodeFromString<GeminiGenerateResponse>(httpResp.bodyAsText())
+                    val candidateText = rawResp.candidates.firstOrNull()?.content?.parts?.firstOrNull()?.text.orEmpty()
+                    if (candidateText.isNotBlank()) {
+                        text = candidateText
+                        break
+                    }
+                }
                 for (line in text.lines()) {
                     val trimmed = line.trim()
                     when {
