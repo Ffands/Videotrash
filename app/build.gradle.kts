@@ -95,10 +95,10 @@ dependencies {
     implementation(files("libs/ffmpeg-kit-full-gpl-6.0-2.LTS.aar"))
     implementation("com.arthenica:smart-exception-java:0.2.1")
 
-    // Option 4A: Native yt-dlp + Aria2c wrapper for Android
-    implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
-    implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
-    implementation("io.github.junkfood02.youtubedl-android:aria2c:0.17.2")
+    // Option 4A: Native yt-dlp + Aria2c wrapper for Android (0.18.1 with updated Python & extractors)
+    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
+    implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
+    implementation("io.github.junkfood02.youtubedl-android:aria2c:0.18.1")
 
     // Google ML Kit Face Detection (Bundled model)
     implementation("com.google.mlkit:face-detection:16.1.7")

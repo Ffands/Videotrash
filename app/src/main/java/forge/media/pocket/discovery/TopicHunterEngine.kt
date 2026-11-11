@@ -1,18 +1,19 @@
 package forge.media.pocket.discovery
 
 import android.content.Context
-import android.util.Log
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import forge.media.pocket.config.DiagnosticLogger
 import io.ktor.client.HttpClient
-import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpHeaders
+import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -71,10 +72,6 @@ data class AutopilotTagSubscription(
 
 class TopicHunterEngine(private val context: Context) {
 
-    companion object {
-        private const val TAG = "TopicHunterEngine"
-    }
-
     private val seenIdsFile = File(context.filesDir, "seen_video_ids.txt")
     private val subscriptionsFile = File(context.filesDir, "autopilot_subscriptions.json")
     private val cookiesFile = File(context.filesDir, "youtube_cookies.txt")
@@ -87,6 +84,11 @@ class TopicHunterEngine(private val context: Context) {
     }
 
     private val httpClient = HttpClient(OkHttp) {
+        install(HttpTimeout) {
+            requestTimeoutMillis = 45_000L
+            connectTimeoutMillis = 15_000L
+            socketTimeoutMillis = 45_000L
+        }
         install(ContentNegotiation) {
             json(jsonFormat)
         }
@@ -141,6 +143,21 @@ class TopicHunterEngine(private val context: Context) {
     private data class RedditSearchVideo(
         @SerialName("fallback_url") val fallbackUrl: String? = null,
         val duration: Int = 0
+    )
+
+    @Serializable
+    private data class PipedSearchResponse(
+        val items: List<PipedSearchItem> = emptyList()
+    )
+
+    @Serializable
+    private data class PipedSearchItem(
+        val url: String? = null,
+        val title: String? = null,
+        val uploaderName: String? = null,
+        val duration: Int? = null,
+        val views: Long? = null,
+        val isShort: Boolean? = null
     )
 
     private fun sanitizeQuery(rawQuery: String): String {
@@ -230,28 +247,30 @@ class TopicHunterEngine(private val context: Context) {
         picked
     }
 
-    private fun searchYouTubeByTags(
+    private suspend fun searchYouTubeByTags(
         queryTags: String,
         sortOrder: ContentSortOrder,
         period: SearchTimePeriod,
         minDurationSec: Int,
         maxDurationSec: Int
     ): List<DiscoveredMediaCandidate> {
-        return try {
+        val queryWithShortsHint = if (
+            queryTags.lowercase().contains("short") ||
+            queryTags.lowercase().contains("клип") ||
+            queryTags.lowercase().contains("эдит") ||
+            queryTags.lowercase().contains("edit")
+        ) {
+            queryTags
+        } else {
+            "$queryTags shorts"
+        }
+
+        val results = mutableListOf<DiscoveredMediaCandidate>()
+
+        try {
             val searchPrefix = when (sortOrder) {
                 ContentSortOrder.NEWEST -> "ytsearchdate20"
                 else -> "ytsearch25"
-            }
-
-            val queryWithShortsHint = if (
-                queryTags.lowercase().contains("short") ||
-                queryTags.lowercase().contains("клип") ||
-                queryTags.lowercase().contains("эдит") ||
-                queryTags.lowercase().contains("edit")
-            ) {
-                queryTags
-            } else {
-                "$queryTags shorts"
             }
 
             val request = YoutubeDLRequest("$searchPrefix:$queryWithShortsHint").apply {
@@ -261,7 +280,6 @@ class TopicHunterEngine(private val context: Context) {
                 addOption("--ignore-errors")
                 addOption("--no-check-certificates")
                 addOption("--geo-bypass")
-                addOption("--extractor-args", "youtube:player_client=android_vr,ios,tv")
                 if (cookiesFile.exists() && cookiesFile.length() > 10L) {
                     addOption("--cookies", cookiesFile.absolutePath)
                 }
@@ -269,7 +287,6 @@ class TopicHunterEngine(private val context: Context) {
 
             val response = YoutubeDL.getInstance().execute(request)
             val lines = response.out.lines().filter { it.trim().startsWith("{") }
-            val results = mutableListOf<DiscoveredMediaCandidate>()
 
             for (line in lines) {
                 try {
@@ -300,12 +317,59 @@ class TopicHunterEngine(private val context: Context) {
                 } catch (_: Exception) {
                 }
             }
-            DiagnosticLogger.log("HUNT:YT", "YouTube выдал ${results.size} роликов по запросу '$queryWithShortsHint'")
-            results
+            DiagnosticLogger.log("HUNT:YT", "YouTube (yt-dlp) выдал ${results.size} роликов по запросу '$queryWithShortsHint'")
         } catch (e: Exception) {
-            DiagnosticLogger.logError("HUNT:YT", "Ошибка поиска YouTube для '$queryTags'", e)
-            emptyList()
+            DiagnosticLogger.logError("HUNT:YT", "Ошибка поиска YouTube (yt-dlp) для '$queryTags'", e)
         }
+
+        if (results.isEmpty()) {
+            // Fallback to Piped search API if YouTube blocked yt-dlp search on VPN IP
+            val pipedMirrors = listOf(
+                "https://pipedapi.kavin.rocks",
+                "https://pipedapi.drgns.space"
+            )
+            for (mirror in pipedMirrors) {
+                try {
+                    DiagnosticLogger.log("HUNT:YT-PIPED", "Резервный поиск YouTube через $mirror/search?q=$queryWithShortsHint")
+                    val httpResp = httpClient.get("$mirror/search") {
+                        parameter("q", queryWithShortsHint)
+                        parameter("filter", "videos")
+                        header(HttpHeaders.UserAgent, "PocketMediaForge/1.2")
+                    }
+                    if (!httpResp.status.isSuccess()) continue
+                    val rawJson = httpResp.bodyAsText()
+                    if (!rawJson.trimStart().startsWith("{")) continue
+
+                    val parsed = jsonFormat.decodeFromString<PipedSearchResponse>(rawJson)
+                    for (item in parsed.items) {
+                        val relUrl = item.url ?: continue
+                        val vidId = relUrl.substringAfter("v=", "").take(11)
+                        if (vidId.length != 11) continue
+                        val dur = item.duration ?: 30
+                        if (dur in minDurationSec..maxDurationSec) {
+                            results.add(
+                                DiscoveredMediaCandidate(
+                                    id = "yt_$vidId",
+                                    url = "https://www.youtube.com/watch?v=$vidId",
+                                    title = item.title ?: "YouTube #$vidId",
+                                    author = item.uploaderName ?: "YouTube Creator",
+                                    platform = HuntPlatform.YOUTUBE,
+                                    durationSec = dur,
+                                    viewOrScoreCount = item.views ?: 1000L
+                                )
+                            )
+                        }
+                    }
+                    if (results.isNotEmpty()) {
+                        DiagnosticLogger.log("HUNT:YT-PIPED", "Через $mirror найдено ${results.size} роликов")
+                        break
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        return results
     }
 
     private suspend fun searchRedditVideosByTags(
@@ -314,60 +378,73 @@ class TopicHunterEngine(private val context: Context) {
         period: SearchTimePeriod,
         maxDurationSec: Int
     ): List<DiscoveredMediaCandidate> = withContext(Dispatchers.IO) {
-        try {
-            val redditSort = when (sortOrder) {
-                ContentSortOrder.POPULAR -> "top"
-                ContentSortOrder.NEWEST -> "new"
-                ContentSortOrder.VIRAL_VELOCITY -> "hot"
-                ContentSortOrder.RELEVANCE -> "relevance"
-            }
-
-            val listing: RedditSearchListing = httpClient.get("https://www.reddit.com/search.json") {
-                header(
-                    HttpHeaders.UserAgent,
-                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36"
-                )
-                parameter("q", queryTags)
-                parameter("sort", redditSort)
-                parameter("t", period.redditParam)
-                parameter("limit", 25)
-            }.body()
-
-            val sdf = SimpleDateFormat("yyyyMMdd", Locale.US)
-
-            val found = listing.data?.children
-                ?.mapNotNull { it.data }
-                ?.filter { it.isVideo && !it.over18 }
-                ?.mapNotNull { post ->
-                    val video = post.media?.redditVideo ?: return@mapNotNull null
-                    val url = video.fallbackUrl ?: return@mapNotNull null
-                    val dur = if (video.duration > 0) video.duration else 25
-                    if (dur > maxDurationSec) return@mapNotNull null
-
-                    val dateStr = if (post.createdUtc > 0) {
-                        sdf.format(java.util.Date((post.createdUtc * 1000).toLong()))
-                    } else {
-                        ""
-                    }
-
-                    DiscoveredMediaCandidate(
-                        id = "rd_${post.id}",
-                        url = url,
-                        title = post.title,
-                        author = "u/${post.author}",
-                        platform = HuntPlatform.REDDIT,
-                        durationSec = dur,
-                        viewOrScoreCount = post.score,
-                        uploadDateYmd = dateStr
-                    )
-                } ?: emptyList()
-
-            DiagnosticLogger.log("HUNT:REDDIT", "Reddit выдал ${found.size} видео по запросу '$queryTags'")
-            found
-        } catch (e: Exception) {
-            DiagnosticLogger.logError("HUNT:REDDIT", "Ошибка поиска Reddit для '$queryTags'", e)
-            emptyList()
+        val redditSort = when (sortOrder) {
+            ContentSortOrder.POPULAR -> "top"
+            ContentSortOrder.NEWEST -> "new"
+            ContentSortOrder.VIRAL_VELOCITY -> "hot"
+            ContentSortOrder.RELEVANCE -> "relevance"
         }
+        val hosts = listOf("https://old.reddit.com", "https://api.reddit.com")
+        val sdf = SimpleDateFormat("yyyyMMdd", Locale.US)
+
+        for (host in hosts) {
+            try {
+                val httpResp = httpClient.get("$host/search.json") {
+                    header(
+                        HttpHeaders.UserAgent,
+                        "android:forge.media.pocket:v1.2.0 (by /u/pocketmediaforge)"
+                    )
+                    header(HttpHeaders.Accept, "application/json")
+                    parameter("q", queryTags)
+                    parameter("sort", redditSort)
+                    parameter("t", period.redditParam)
+                    parameter("limit", 25)
+                    parameter("raw_json", 1)
+                }
+
+                if (!httpResp.status.isSuccess()) {
+                    DiagnosticLogger.log("HUNT:REDDIT", "Reddit ($host) вернул HTTP ${httpResp.status.value}")
+                    continue
+                }
+
+                val bodyText = httpResp.bodyAsText()
+                if (!bodyText.trimStart().startsWith("{")) continue
+
+                val listing = jsonFormat.decodeFromString<RedditSearchListing>(bodyText)
+                val found = listing.data?.children
+                    ?.mapNotNull { it.data }
+                    ?.filter { it.isVideo && !it.over18 }
+                    ?.mapNotNull { post ->
+                        val video = post.media?.redditVideo ?: return@mapNotNull null
+                        val url = video.fallbackUrl ?: return@mapNotNull null
+                        val dur = if (video.duration > 0) video.duration else 25
+                        if (dur > maxDurationSec) return@mapNotNull null
+
+                        val dateStr = if (post.createdUtc > 0) {
+                            sdf.format(java.util.Date((post.createdUtc * 1000).toLong()))
+                        } else {
+                            ""
+                        }
+
+                        DiscoveredMediaCandidate(
+                            id = "rd_${post.id}",
+                            url = url,
+                            title = post.title,
+                            author = "u/${post.author}",
+                            platform = HuntPlatform.REDDIT,
+                            durationSec = dur,
+                            viewOrScoreCount = post.score,
+                            uploadDateYmd = dateStr
+                        )
+                    } ?: emptyList()
+
+                DiagnosticLogger.log("HUNT:REDDIT", "Reddit ($host) выдал ${found.size} видео по запросу '$queryTags'")
+                if (found.isNotEmpty()) return@withContext found
+            } catch (e: Exception) {
+                DiagnosticLogger.log("HUNT:REDDIT", "Предупреждение поиска Reddit ($host): ${e.message?.take(100)}")
+            }
+        }
+        emptyList()
     }
 
     private fun searchPikabuByTags(

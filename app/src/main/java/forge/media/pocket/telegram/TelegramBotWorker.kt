@@ -381,11 +381,7 @@ class TelegramBotWorker(
     }
 
     private suspend fun sendFullDiagnosticLog(chatId: Long) {
-        val ytdlpVer = try {
-            YoutubeDL.getInstance().version(context) ?: "unknown"
-        } catch (_: Exception) {
-            "unknown"
-        }
+        val ytdlpVer = PipelineForegroundService.queryRealYtDlpVersion()
         val cookiesFile = configStore.getYoutubeCookiesFile()
         val cookiesStatus = if (cookiesFile != null) "ВКЛ (${cookiesFile.length() / 1024} KB)" else "НЕТ (можно скинуть .txt в чат)"
 
@@ -429,11 +425,7 @@ class TelegramBotWorker(
         val poolSize = clutterFilter.listVerifiedPoolClips().size
         val subs = topicHunter.listAutopilotSubscriptions()
         val svcState = PipelineForegroundService.statusFlow.value
-        val ytdlpVer = try {
-            YoutubeDL.getInstance().version(context) ?: "unknown"
-        } catch (_: Exception) {
-            "unknown"
-        }
+        val ytdlpVer = PipelineForegroundService.queryRealYtDlpVersion()
         val cookiesLoaded = configStore.getYoutubeCookiesFile() != null
 
         val text = "📊 Статус узла (OnePlus Snapdragon):\n\n" +
@@ -961,17 +953,12 @@ class TelegramBotWorker(
                 return
             }
             "ytdlp_update" -> {
-                sendMessage(chatId, "⬆️ Запускаю обновление бинарника yt-dlp до последней версии...")
+                sendMessage(chatId, "⬆️ Скачиваю свежее ядро yt-dlp (2026.10.21 tv_samsung) напрямую с GitHub...")
                 scope.launch(Dispatchers.IO) {
                     try {
-                        DiagnosticLogger.log("YTDLP-UPDATE", "Ручной запуск обновления yt-dlp из Telegram...")
-                        val status = YoutubeDL.getInstance().updateYoutubeDL(
-                            context,
-                            YoutubeDL.UpdateChannel._NIGHTLY
-                        )
-                        val ver = YoutubeDL.getInstance().version(context) ?: "unknown"
-                        DiagnosticLogger.log("YTDLP-UPDATE", "Результат обновления: $status | Текущая версия: $ver")
-                        sendMessage(chatId, "✅ Ядро yt-dlp обновлено!\n• Статус: $status\n• Версия: $ver")
+                        DiagnosticLogger.log("YTDLP-UPDATE", "Ручной запуск прямого обновления yt-dlp из Telegram...")
+                        val ver = PipelineForegroundService.ensureModernYtDlpBinary(context, forceDownload = true)
+                        sendMessage(chatId, "✅ Ядро yt-dlp проверено и готово!\n• Рабочая версия: $ver")
                     } catch (e: Exception) {
                         DiagnosticLogger.logError("YTDLP-UPDATE", "Ошибка ручного обновления yt-dlp", e)
                         sendMessage(chatId, "❌ Ошибка обновления yt-dlp: ${e.message}")

@@ -199,6 +199,10 @@ class SubtitleAssTransformer(
                 addOption("--sub-langs", langPref)
                 addOption("--sub-format", "vtt")
                 addOption("--no-playlist")
+                addOption("--no-check-certificates")
+                configStore.getYoutubeCookiesFile()?.let { cookies ->
+                    addOption("--cookies", cookies.absolutePath)
+                }
                 addOption("-o", outTemplate)
             }
             YoutubeDL.getInstance().execute(request)
