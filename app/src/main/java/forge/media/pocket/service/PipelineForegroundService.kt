@@ -202,9 +202,9 @@ class PipelineForegroundService : LifecycleService() {
         }
     }
 
-    override fun onTimeout(startId: Int, fgsType: Int) {
-        Log.w(TAG, "Android 14 FGS onTimeout triggered for fgsType=$fgsType")
-        super.onTimeout(startId, fgsType)
+    override fun onTimeout(startId: Int) {
+        Log.w(TAG, "Android 14 FGS onTimeout triggered for startId=$startId")
+        super.onTimeout(startId)
     }
 
     override fun onDestroy() {
