@@ -1,0 +1,6 @@
+{
+  "name": "Pocket Media Forge — Android Pipeline Architect",
+  "description": "Production Kotlin/Android 14 (API 34) source generator, CI/CD workflow builder, and skeptical architectural audit for autonomous video processing on Snapdragon.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
