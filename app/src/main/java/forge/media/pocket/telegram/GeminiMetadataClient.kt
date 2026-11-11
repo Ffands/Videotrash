@@ -92,10 +92,10 @@ class GeminiMetadataClient(private val configStore: NodeConfigStore) {
 
         val promoInstruction = if (
             adConfig.mode == AdInsertionMode.PINNED_COMMENT_ONLY ||
-            adConfig.sponsorTrackingUrl.isNotBlank()
+            adConfig.promoLinkForComment.isNotBlank()
         ) {
             "IMPORTANT (Ad Strategy C): Naturally weave this promotional hook and link into 'pinnedComment' and 'description': " +
-                "${adConfig.bannerText} ${adConfig.sponsorTrackingUrl}"
+                "${adConfig.bannerText} ${adConfig.promoLinkForComment}"
         } else {
             "In 'pinnedComment', include the original author or anime/show title and ask an engaging question."
         }

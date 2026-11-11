@@ -45,6 +45,10 @@ class NodeConfigStore(private val context: Context) {
         return if (!local.isNullOrEmpty()) local else BuildConfig.DEFAULT_ALLOWED_CHAT_ID.trim()
     }
 
+    fun getAllowedChatIdLong(): Long {
+        return getAllowedChatId().toLongOrNull() ?: 0L
+    }
+
     fun setAllowedChatId(chatId: String) {
         prefs.edit().putString(KEY_ALLOWED_CHAT_ID, chatId.trim()).apply()
     }
@@ -55,6 +59,8 @@ class NodeConfigStore(private val context: Context) {
             ?: "SPONSORED • ССЫЛКА В ЗАКРЕПЕ"
     }
 
+    fun getDefaultBannerText(): String = getCustomBannerText()
+
     fun setCustomBannerText(text: String) {
         prefs.edit().putString(KEY_BANNER_TEXT, text.trim()).apply()
     }
@@ -62,6 +68,8 @@ class NodeConfigStore(private val context: Context) {
     fun getSponsorPromoUrl(): String {
         return prefs.getString(KEY_PROMO_URL, "") ?: ""
     }
+
+    fun getDefaultPromoUrl(): String = getSponsorPromoUrl()
 
     fun setSponsorPromoUrl(url: String) {
         prefs.edit().putString(KEY_PROMO_URL, url.trim()).apply()
@@ -71,4 +79,6 @@ class NodeConfigStore(private val context: Context) {
         val f = File(context.filesDir, "ad_assets/midroll.mp4")
         return if (f.exists() && f.length() > 0L) f else null
     }
+
+    fun getSavedMidrollFile(): File? = getMidrollVideoFile()
 }

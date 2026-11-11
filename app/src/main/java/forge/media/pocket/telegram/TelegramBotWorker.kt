@@ -108,7 +108,7 @@ class TelegramBotWorker(
     private val isAutopilotEnabled = AtomicBoolean(false)
     private var autopilotJob: Job? = null
     private var autopilotIntervalMinutes: Long = 60L
-    private var autopilotChatId: Long = configStore.getAllowedChatId()
+    private var autopilotChatId: Long = configStore.getAllowedChatIdLong()
 
     private val sessions = ConcurrentHashMap<String, InteractiveJobSession>()
     private val huntFilters = ConcurrentHashMap<String, PendingHuntFilterState>()
@@ -199,7 +199,7 @@ class TelegramBotWorker(
         "https://api.telegram.org/bot${configStore.getTelegramBotToken()}"
 
     private fun isChatAuthorized(chatId: Long): Boolean {
-        val allowed = configStore.getAllowedChatId()
+        val allowed = configStore.getAllowedChatIdLong()
         return allowed == 0L || allowed == chatId
     }
 
