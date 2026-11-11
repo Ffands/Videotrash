@@ -1959,6 +1959,42 @@ class MainActivity : AppCompatActivity() {
             }
             addView(batteryBtn, buttonLayoutParams())
 
+            val nodeManageRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                weightSum = 2f
+                setPadding(0, dp(6), 0, 0)
+            }
+
+            val autoLaunchBtn = createStyledButton(
+                "⚡ Автозапуск OnePlus / ColorOS",
+                "#E4E4E7",
+                "#27272A"
+            ).apply {
+                setOnClickListener {
+                    val intent = powerHelper.buildOxygenOsAutoLaunchIntent()
+                    if (intent != null) {
+                        startActivity(intent)
+                    } else {
+                        Toast.makeText(this@MainActivity, "Системное меню автозапуска ColorOS не требуется на этой прошивке ✅", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+
+            val stopNodeBtn = createStyledButton(
+                "⏹ Остановить узел",
+                "#FCA5A5",
+                "#3F1D1D"
+            ).apply {
+                setOnClickListener {
+                    PipelineForegroundService.stopService(applicationContext)
+                    Toast.makeText(this@MainActivity, "⏹ Фоновый узел остановлен.", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            nodeManageRow.addView(autoLaunchBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.15f).apply { rightMargin = dp(6) })
+            nodeManageRow.addView(stopNodeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.85f))
+            addView(nodeManageRow)
+
             addView(sectionHeader("2. ПОЛНЫЙ ЛОГ ДЕЙСТВИЙ С ЗАПУСКА (LIVE)"))
 
             liveLogTextView = TextView(this@MainActivity).apply {

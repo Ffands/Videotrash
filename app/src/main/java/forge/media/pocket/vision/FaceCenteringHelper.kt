@@ -1,7 +1,6 @@
 package forge.media.pocket.vision
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.media.MediaMetadataRetriever
@@ -341,11 +340,6 @@ class FaceCenteringHelper(private val context: Context) {
                 if (cont.isActive) cont.resume(emptyList())
             }
         }
-    }
-
-    fun isVerticalSource(videoFile: File): Boolean {
-        val (w, h) = probeVideoDimensions(videoFile)
-        return h > w
     }
 
     private fun probeVideoDimensions(videoFile: File): Pair<Int, Int> {

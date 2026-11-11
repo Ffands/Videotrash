@@ -6,7 +6,6 @@ import com.yausername.youtubedl_android.YoutubeDLRequest
 import forge.media.pocket.config.DiagnosticLogger
 import forge.media.pocket.config.NodeConfigStore
 import io.ktor.client.HttpClient
-import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
@@ -27,7 +26,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.text.SimpleDateFormat
@@ -82,7 +80,10 @@ data class DiscoveredMediaCandidate(
     val viewOrScoreCount: Long,
     val uploadDateYmd: String = "",
     val descriptionSnippet: String = "",
-    val aiWhatsInside: String = ""
+    val aiWhatsInside: String = "",
+    val cloutStatusLabel: String = "",
+    val entityPopularityNote: String = "",
+    val conversionScore: Int = 0
 )
 
 @Serializable
@@ -102,15 +103,6 @@ data class VideoInsideDigest(
 )
 
 @Serializable
-data class AutopilotTagSubscription(
-    val queryTags: String,
-    val platform: HuntPlatform = HuntPlatform.YOUTUBE,
-    val sortOrder: ContentSortOrder = ContentSortOrder.POPULAR,
-    val period: SearchTimePeriod = SearchTimePeriod.WEEK,
-    val maxDurationSec: Int = 180
-)
-
-@Serializable
 data class DiscoveredSpamChannel(
     val channelName: String,
     val channelUrl: String,
@@ -127,7 +119,6 @@ class TopicHunterEngine(private val context: Context) {
 
     private val configStore = NodeConfigStore(context)
     private val seenIdsFile = File(context.filesDir, "seen_video_ids.txt")
-    private val subscriptionsFile = File(context.filesDir, "autopilot_subscriptions.json")
     private val cookiesFile = File(context.filesDir, "youtube_cookies.txt")
     private val stagingDir = File(context.cacheDir, "work_staging").apply { mkdirs() }
     private val stateMutex = Mutex()
@@ -250,13 +241,19 @@ class TopicHunterEngine(private val context: Context) {
     )
 
     @Serializable
-    private data class AiQueryExpansionDto(
-        val queries: List<String> = emptyList()
+    private data class AdaptiveNichePlanDto(
+        val activeMetaDescription: String = "",
+        val queries: List<String> = emptyList(),
+        val tierOneEntities: List<String> = emptyList(),
+        val outdatedBlacklist: List<String> = emptyList()
     )
 
     @Serializable
     private data class AiRerankedItemDto(
         val index: Int = 0,
+        val cloutTier: String = "TOP_FANBASE",
+        val conversionScore: Int = 85,
+        val entityWhoIs: String = "",
         val whatsInside: String = ""
     )
 
@@ -285,23 +282,29 @@ class TopicHunterEngine(private val context: Context) {
         maxDurationSec: Int = durationMode.maxSec
     ): List<DiscoveredMediaCandidate> = withContext(Dispatchers.IO) {
         val cleanQuery = sanitizeQuery(queryTags)
-        val hasGeminiKey = configStore.getGeminiApiKey().isNotBlank()
 
         DiagnosticLogger.log(
             "HUNT",
-            "Умный поиск: '$cleanQuery' (язык=${languageMode.name}, период=${period.name}, формат=${durationMode.name}, сорт=${sortOrder.name})"
+            "Адаптивный поиск фан-базы: '$cleanQuery' (язык=${languageMode.name}, период=${period.name}, формат=${durationMode.name}, сорт=${sortOrder.name})"
         )
 
-        // Stage 1: Build smart expanded queries combining:
-        // 1) Famous comedians & popular format variations ("стендап монологи", "стендапы о жизни", "стендап истории", etc.)
-        // 2) Live YouTube Autocomplete popular similar queries
-        // 3) AI query expansion (with geo-block fallback for Russian mobile IPs without VPN)
-        val searchQueries = buildSmartExpandedQueries(
+        // Stage 1: Build 100% adaptive Niche & Fanbase Plan (for ANY topic: CS, Standup, Podcasts, Anime, Cars, UFC, etc.):
+        // - Determines current living meta with active fanbase (e.g. CS2 Premier/Major instead of dead CS 1.6)
+        // - Identifies Tier-1 recognizable personalities/creators/shows that drive likes & comments
+        // - Identifies dead/outdated trap keywords for this specific niche to ban
+        // - Combines AI adaptive queries + live YouTube Autocomplete suggestions
+        val nichePlan = buildAdaptiveFanbaseSearchPlan(
             userPrompt = cleanQuery,
             durationMode = durationMode,
             languageMode = languageMode
         )
-        DiagnosticLogger.log("HUNT:QUERIES", "Поисковые запросы (${searchQueries.size} шт.): ${searchQueries.joinToString(" | ")}")
+        val searchQueries = nichePlan.queries.ifEmpty { listOf(cleanQuery) }
+
+        DiagnosticLogger.log(
+            "HUNT:META",
+            "Актуальная мета ниши: ${nichePlan.activeMetaDescription.ifBlank { cleanQuery }} | Топ-триггеры фанбазы: ${nichePlan.tierOneEntities.joinToString(", ")} | Бан старья: ${nichePlan.outdatedBlacklist.joinToString(", ")}"
+        )
+        DiagnosticLogger.log("HUNT:QUERIES", "Адаптивные запросы (${searchQueries.size} шт.): ${searchQueries.joinToString(" | ")}")
 
         val seenIds = loadSeenIds()
         val rawPool = mutableListOf<DiscoveredMediaCandidate>()
@@ -316,7 +319,7 @@ class TopicHunterEngine(private val context: Context) {
                 rawPool.addAll(
                     searchYouTubeByTags(
                         queryTags = q,
-                        userOriginalTopic = cleanQuery,
+                        nichePlan = nichePlan,
                         sortOrder = sortOrder,
                         period = period,
                         languageMode = languageMode,
@@ -359,133 +362,156 @@ class TopicHunterEngine(private val context: Context) {
             ContentSortOrder.VIRAL_VELOCITY ->
                 unseenCandidates.sortedByDescending { computeViralVelocityScore(it) }
             ContentSortOrder.RELEVANCE ->
-                unseenCandidates.sortedByDescending { scoreCandidateRelevance(it, cleanQuery) }
+                unseenCandidates.sortedByDescending { scoreCandidateRelevance(it, cleanQuery, nichePlan) }
         }
 
-        // Stage 2: Rerank and generate "Что внутри" summary (with automatic fallback if direct Gemini is geo-blocked)
+        // Stage 2: Clout & Popularity Inspector ("Ноунейм vs Топ Фан-База") + "Что внутри" summary
         val finalPicked = if (preSorted.isNotEmpty()) {
             rerankAndSummarizeViaGemini(
                 userFreeformPrompt = cleanQuery,
+                nichePlan = nichePlan,
                 languageMode = languageMode,
-                candidates = preSorted.take(22),
+                candidates = preSorted.take(24),
                 limitCount = limitCount.coerceIn(1, 10)
             )
         } else {
             emptyList()
         }
 
-        DiagnosticLogger.log("HUNT", "Итого отобрано кандидатов: ${finalPicked.size} из ${deduplicatedPool.size}")
+        DiagnosticLogger.log("HUNT", "Итого отобрано кандидатов с проверкой популярности: ${finalPicked.size} из ${deduplicatedPool.size}")
         markCandidatesAsSeen(finalPicked.map { it.id })
         finalPicked
     }
 
     /**
-     * Многоуровневый генератор поисковых запросов:
-     * 1. Распознаёт тематику (например, стендап/истории/монологи/диалоги) и подставляет популярных комиков + ходовые запросы
-     *    ("стендап монологи", "стендапы о жизни", "стендап истории", "стендап общение с залом").
-     * 2. Если выбран режим "Английский (Под переозвучку EN->RU)" — строит хитовые англоязычные запросы и топ западных комиков/авторов.
-     * 3. Подтягивает живые популярные похожие запросы из YouTube Autocomplete.
-     * 4. Дополняет AI-запросами (с обходом гео-блока РФ без VPN).
+     * Полностью адаптивный планировщик ниши и фан-базы (без зашитых списков):
+     * Для ЛЮБОЙ темы пользователя (будь то КС, стендап, подкасты, аниме, UFC, авто или наука)
+     * сам определяет:
+     * 1) Какая версия/формат этой темы сейчас жива и имеет активную фан-базу (например, CS2 вместо мёртвого CS 1.6;
+     *    современные стендап-разгоны и монологи о жизни вместо архивов Жванецкого/Петросяна).
+     * 2) Какие конкретно медийные лица / комики / про-игроки / шоу в этой нише сейчас дают максимальную конверсию в лайки и комменты.
+     * 3) Какие популярные смежные запросы сейчас реально ищут зрители на YouTube (через AI + живой YouTube Autocomplete).
+     * 4) Какие слова-ловушки старья нужно заблокировать именно для этой темы.
      */
-    private suspend fun buildSmartExpandedQueries(
+    private suspend fun buildAdaptiveFanbaseSearchPlan(
         userPrompt: String,
         durationMode: SearchDurationMode,
         languageMode: SearchLanguageMode
-    ): List<String> {
-        val lower = userPrompt.lowercase(Locale.getDefault())
-        val isStandupOrComedy = listOf(
-            "стендап", "комик", "юмор", "шутк", "монолог", "диалог", "импровиз", "разгон", "истори", "рассказ", "standup", "stand up"
-        ).any { lower.contains(it) }
+    ): AdaptiveNichePlanDto {
+        val hl = if (languageMode == SearchLanguageMode.ENGLISH_FOR_DUB) "en" else "ru"
+        val liveAutocomplete = fetchYouTubeAutocompleteSuggestions(userPrompt, hl)
 
-        val resultQueries = linkedSetOf<String>()
+        val modeHint = when (durationMode) {
+            SearchDurationMode.ORIGINALS_1_TO_6M ->
+                "Ищем цельные оригинальные ролики/выступления/хаlайты 1–6 минут (не короткие чужие эдиты)."
+            SearchDurationMode.SHORTS_ONLY ->
+                "Ищем динамичные вертикальные Shorts / клипы до 75 секунд."
+            SearchDurationMode.ANY_UP_TO_6M ->
+                "Ищем вовлекающие ролики до 6 минут с высокой плотностью смысла/эмоций."
+        }
 
-        if (languageMode == SearchLanguageMode.ENGLISH_FOR_DUB) {
-            if (isStandupOrComedy) {
-                // English standup & storytelling queries ideal for RU voiceover dubbing
-                val subTopicEn = when {
-                    lower.contains("отношен") || lower.contains("девуш") || lower.contains("жен") || lower.contains("свидан") -> "relationships dating"
-                    lower.contains("работ") || lower.contains("офис") -> "work job office"
-                    lower.contains("дет") || lower.contains("сем") || lower.contains("родит") -> "family parents"
-                    lower.contains("диалог") || lower.contains("зал") -> "crowd work interaction"
-                    else -> "life funny story"
+        val langRule = when (languageMode) {
+            SearchLanguageMode.RUSSIAN_ONLY ->
+                "Генерируй запросы и имена СТРОГО НА РУССКОМ ЯЗЫКЕ (для русскоязычного YouTube)."
+            SearchLanguageMode.ENGLISH_FOR_DUB ->
+                "Генерируй запросы и имена СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ (даже если запрос написан по-русски!), чтобы найти виральные англоязычные исходники с огромной фан-базой под русскую переозвучку."
+            SearchLanguageMode.ANY_LANGUAGE ->
+                "Сгенерируй 3 запроса на русском и 2 на английском."
+        }
+
+        val suggestContext = if (liveAutocomplete.isNotEmpty()) {
+            "Живые автоподсказки YouTube по этой теме прямо сейчас: ${liveAutocomplete.joinToString(", ")}"
+        } else {
+            ""
+        }
+
+        val prompt = """
+            Ты — аналитик вирального контента и фан-сообществ YouTube/Shorts/Reels (2025–2026 год).
+            Пользователь ввёл тему поиска: "$userPrompt"
+            Формат: $modeHint
+            Язык поиска: $langRule
+            $suggestContext
+
+            Твоя главная цель — найти такой контент по этой теме, у которого ПРЯМО СЕЙЧАС есть живая, активная фан-база, чтобы ролики давали максимум просмотров, лайков, комментариев и конверсии.
+            Проанализируй нишу АДАПТИВНО:
+            1. "activeMetaDescription": Какая актуальная версия/мета этой ниши сейчас жива и собирает трафик?
+               - Например, если запрос про "КС / КСку" — актуальная мета это СТРОГО CS2 (Counter-Strike 2, Premier, Faceit, Major, про-сцена), а НЕ мёртвый CS 1.6 или CS:Source.
+               - Если запрос про "стендап рассказы / диалоги" — актуальная мета это современные стендап-монологи, стендапы о жизни, стендап истории и живое общение с залом (импровизация), а НЕ старая советская/телевизионная эстрада.
+               - Примени этот же принцип к ЛЮБОЙ теме пользователя.
+            2. "tierOneEntities": Назови 6–8 самых популярных прямо сейчас персон / комиков / игроков / авторов / шоу / команд в этой нише, у которых огромная фан-база (чьё имя или лицо в кадре гарантирует лайки и комментарии).
+            3. "outdatedBlacklist": Укажи 6–10 слов-паразитов устаревшего/мёртвого контента именно для этой ниши, которые нужно жёстко отсечь (например для КС: ["1.6", "кс 1.6", "cs 1.6", "source", "condition zero"]; для стендапа: ["жванецкий", "петросян", "аншлаг", "одесский юмор", "услышано в одессе", "смехопанорама", "кривое зеркало"]).
+            4. "queries": Составь 5 поисковых запросов для YouTube (по 3–6 слов каждый), которые:
+               - Включают популярные смежные формулировки, которые реально ищут фанаты этой темы (например для стендапа: "стендап монологи", "стендапы о жизни", "стендап истории", "стендап импровизация с залом"; для игр/спорта/науки — их главные хайповые форматы);
+               - Включают имена/названия из "tierOneEntities";
+               - Отражают только актуальную мету 2025–2026 года.
+
+            Верни СТРОГО валидный JSON без markdown-обёрток:
+            {
+              "activeMetaDescription": "...",
+              "tierOneEntities": ["...", "..."],
+              "outdatedBlacklist": ["...", "..."],
+              "queries": ["запрос 1", "запрос 2", "запрос 3", "запрос 4", "запрос 5"]
+            }
+        """.trimIndent()
+
+        try {
+            val rawJson = callGeminiJson(configStore.getGeminiApiKey(), prompt)
+            if (!rawJson.isNullOrBlank()) {
+                val parsed = jsonFormat.decodeFromString<AdaptiveNichePlanDto>(rawJson)
+                val mergedQueries = linkedSetOf<String>()
+                for (q in parsed.queries) {
+                    val clean = sanitizeQuery(q)
+                    if (clean.isNotBlank()) mergedQueries.add(clean)
                 }
-                resultQueries.add("stand up comedy monologue $subTopicEn")
-                resultQueries.add("stand up crowd work best moments $subTopicEn")
-                resultQueries.add("Matt Rife Andrew Schulz stand up $subTopicEn")
-                resultQueries.add("Theo Von Bill Burr funny story clip")
-                resultQueries.add("stand up comedians funny stories about life")
-            } else {
-                // Translate / expand any topic into English for dubbing via AI + heuristics
-                val aiEnQueries = expandFreeformPromptToSearchQueries(userPrompt, durationMode, languageMode)
-                resultQueries.addAll(aiEnQueries)
-                val ytSuggestions = fetchYouTubeAutocompleteSuggestions("$userPrompt english", "en")
-                resultQueries.addAll(ytSuggestions.take(2))
+                for (sug in liveAutocomplete) {
+                    if (mergedQueries.size >= 6) break
+                    val cleanSug = sanitizeQuery(sug)
+                    if (cleanSug.isNotBlank() && !containsBlacklistedTerm(cleanSug, parsed.outdatedBlacklist)) {
+                        mergedQueries.add(cleanSug)
+                    }
+                }
+                if (mergedQueries.isNotEmpty()) {
+                    return parsed.copy(
+                        queries = mergedQueries.take(5),
+                        outdatedBlacklist = (parsed.outdatedBlacklist + universalDeadContentBlacklist(userPrompt)).distinct()
+                    )
+                }
             }
-            return resultQueries.map { sanitizeQuery(it) }.filter { it.isNotBlank() }.take(5)
+        } catch (e: Exception) {
+            DiagnosticLogger.log("HUNT:PLAN", "Предупреждение AI-планировщика ниши: ${e.message?.take(80)}")
         }
 
-        // Russian / Any Language mode:
-        if (isStandupOrComedy) {
-            // Extract specific topic words (excluding generic words like "стендап", "диалоги", "рассказы")
-            val genericWords = setOf(
-                "стендап", "стендапы", "диалоги", "диалог", "рассказы", "рассказ", "истории", "история",
-                "монологи", "монолог", "комики", "комиков", "юмор", "шутки", "про", "о", "об", "на", "в"
-            )
-            val specificTopicWords = lower
-                .replace(Regex("""[^a-zа-яё0-9\s]"""), " ")
-                .split(Regex("""\s+"""))
-                .filter { it.length >= 3 && it !in genericWords }
-                .joinToString(" ")
-
-            if (specificTopicWords.isNotBlank()) {
-                resultQueries.add("стендап монолог про $specificTopicWords")
-                resultQueries.add("стендап истории $specificTopicWords")
-                resultQueries.add("стендап общение с залом $specificTopicWords")
-                resultQueries.add("стендап о жизни $specificTopicWords")
-            } else {
-                // Popular related queries requested by user + crowd work + top Russian comedians
-                resultQueries.add("стендап монологи лучшие")
-                resultQueries.add("стендапы о жизни истории")
-                resultQueries.add("стендап истории комиков")
-                resultQueries.add("стендап общение с залом импровизация")
-                resultQueries.add("Щербаков Чебатков Орлов Коваль стендап монолог")
-                resultQueries.add("StandUp Club 1 Outside Stand Up лучшие моменты")
+        // Universal adaptive fallback if AI is offline: uses live YouTube Autocomplete + smart version normalization
+        val fallbackBlacklist = universalDeadContentBlacklist(userPrompt)
+        val normalizedBase = normalizeLegacyNicheTerms(userPrompt, languageMode)
+        val fallbackQueries = linkedSetOf<String>()
+        fallbackQueries.add(normalizedBase)
+        for (sug in liveAutocomplete) {
+            if (!containsBlacklistedTerm(sug, fallbackBlacklist)) {
+                fallbackQueries.add(sanitizeQuery(sug))
             }
-        } else {
-            resultQueries.add(userPrompt)
         }
-
-        // Fetch real YouTube popular autocomplete suggestions (works in 70ms without VPN in RU!)
-        val seedForSuggest = if (isStandupOrComedy && lower.contains("диалог")) {
-            "стендап общение с"
-        } else if (isStandupOrComedy && lower.contains("рассказ")) {
-            "стендап истории"
-        } else {
-            userPrompt
-        }
-        val ytSimilar = fetchYouTubeAutocompleteSuggestions(seedForSuggest, "ru")
-        for (sug in ytSimilar) {
-            if (resultQueries.size >= 6) break
-            if (!containsArchaicComedyBlacklist(sug)) {
-                resultQueries.add(sug)
+        // Fetch second-hop autocomplete from the first suggestion to discover adjacent popular queries automatically
+        if (liveAutocomplete.isNotEmpty()) {
+            val secondHop = fetchYouTubeAutocompleteSuggestions(liveAutocomplete.first(), hl)
+            for (sug2 in secondHop) {
+                if (fallbackQueries.size >= 5) break
+                if (!containsBlacklistedTerm(sug2, fallbackBlacklist)) {
+                    fallbackQueries.add(sanitizeQuery(sug2))
+                }
             }
         }
 
-        // Also add AI-expanded queries (via direct Gemini or geo-unblocked fallback)
-        val aiQueries = expandFreeformPromptToSearchQueries(userPrompt, durationMode, languageMode)
-        for (aq in aiQueries) {
-            if (resultQueries.size >= 6) break
-            if (!containsArchaicComedyBlacklist(aq)) {
-                resultQueries.add(aq)
-            }
-        }
-
-        return resultQueries.map { sanitizeQuery(it) }.filter { it.isNotBlank() }.take(5)
+        return AdaptiveNichePlanDto(
+            activeMetaDescription = normalizedBase,
+            queries = fallbackQueries.filter { it.isNotBlank() }.take(5),
+            tierOneEntities = emptyList(),
+            outdatedBlacklist = fallbackBlacklist
+        )
     }
 
     /**
      * Запрашивает живые популярные похожие запросы из официального автодополнения YouTube.
-     * Работает мгновенно (~70 мс) с российских мобильных IP без VPN.
      */
     private suspend fun fetchYouTubeAutocompleteSuggestions(seedQuery: String, hl: String = "ru"): List<String> {
         return try {
@@ -498,14 +524,13 @@ class TopicHunterEngine(private val context: Context) {
             }
             if (!httpResp.status.isSuccess()) return emptyList()
             val raw = httpResp.bodyAsText()
-            // Format: ["seed", ["sug 1", "sug 2", "sug 3", ...]]
             val suggestionsBlock = raw.substringAfter("[", "").substringAfter("[", "").substringBefore("]", "")
             val parsed = Regex(""""([^"]+)"""").findAll(suggestionsBlock)
                 .map { it.groupValues[1].trim() }
-                .filter { it.length in 5..65 && !it.equals(seedQuery, ignoreCase = true) }
+                .filter { it.length in 4..65 && !it.equals(seedQuery, ignoreCase = true) }
                 .toList()
             if (parsed.isNotEmpty()) {
-                DiagnosticLogger.log("YT-SUGGEST", "Похожие популярные запросы YouTube: ${parsed.take(4).joinToString(" | ")}")
+                DiagnosticLogger.log("YT-SUGGEST", "Живые популярные запросы YouTube: ${parsed.take(4).joinToString(" | ")}")
             }
             parsed.take(4)
         } catch (_: Exception) {
@@ -513,52 +538,13 @@ class TopicHunterEngine(private val context: Context) {
         }
     }
 
-    private suspend fun expandFreeformPromptToSearchQueries(
-        userPrompt: String,
-        durationMode: SearchDurationMode,
-        languageMode: SearchLanguageMode = SearchLanguageMode.RUSSIAN_ONLY
-    ): List<String> {
-        return try {
-            val modeHint = when (durationMode) {
-                SearchDurationMode.ORIGINALS_1_TO_6M ->
-                    "User wants original unedited videos/monologues/standups/interviews (1-6 minutes), NOT short edits."
-                SearchDurationMode.SHORTS_ONLY ->
-                    "User wants short vertical clips/highlights."
-                SearchDurationMode.ANY_UP_TO_6M ->
-                    "User wants engaging standup monologues, stories, or segments up to 6 minutes."
-            }
-
-            val langInstruction = when (languageMode) {
-                SearchLanguageMode.RUSSIAN_ONLY ->
-                    "Generate queries strictly in RUSSIAN. If the topic is standup/comedy/stories, include popular Russian search phrases ('стендап монологи', 'стендапы о жизни', 'стендап истории', 'общение с залом') and famous modern Russian standup comedians (Щербаков, Чебатков, Орлов, Коваль, Бебуришвили, Дорохов, Outside Stand Up, StandUp Club #1). NEVER use archaic TV humor."
-                SearchLanguageMode.ENGLISH_FOR_DUB ->
-                    "Generate queries strictly in ENGLISH (even if user wrote in Russian!) so the user can find viral English videos to dub/voiceover into Russian. If standup/stories, include famous English comedians (Matt Rife, Andrew Schulz, Theo Von, Bill Burr, Dave Chappelle) and 'stand up monologue', 'crowd work', 'funny life story'."
-                SearchLanguageMode.ANY_LANGUAGE ->
-                    "Generate 2 queries in Russian and 1 query in English."
-            }
-
-            val prompt = """
-                The user wants to find videos on YouTube based on this request:
-                "$userPrompt"
-                Context: $modeHint
-                Language & Style rule: $langInstruction
-
-                Convert this request into 3 concise, high-precision YouTube search queries (3 to 7 words each).
-                Return strictly JSON:
-                {"queries": ["query 1", "query 2", "query 3"]}
-            """.trimIndent()
-
-            val rawJson = callGeminiJson(configStore.getGeminiApiKey(), prompt) ?: return emptyList()
-            val parsed = jsonFormat.decodeFromString<AiQueryExpansionDto>(rawJson)
-            parsed.queries.map { sanitizeQuery(it) }.filter { it.isNotBlank() }.distinct().take(3)
-        } catch (e: Exception) {
-            DiagnosticLogger.log("HUNT:AI", "Предупреждение AI-расширения запроса: ${e.message?.take(80)}")
-            emptyList()
-        }
-    }
-
+    /**
+     * Stage 2: Проверка медийности/популярности автора или комика («Ноунейм / Стрём» vs «Топ Фан-База / Конверсия»)
+     * + отбор лучших кандидатов и генерация выжимки «Что внутри».
+     */
     private suspend fun rerankAndSummarizeViaGemini(
         userFreeformPrompt: String,
+        nichePlan: AdaptiveNichePlanDto,
         languageMode: SearchLanguageMode,
         candidates: List<DiscoveredMediaCandidate>,
         limitCount: Int
@@ -567,29 +553,51 @@ class TopicHunterEngine(private val context: Context) {
 
         return try {
             val catalogText = candidates.mapIndexed { idx, c ->
-                val descPart = if (c.descriptionSnippet.isNotBlank()) " | desc: ${c.descriptionSnippet.take(140)}" else ""
+                val descPart = if (c.descriptionSnippet.isNotBlank()) " | desc: ${c.descriptionSnippet.take(150)}" else ""
                 "[$idx] title=\"${c.title}\" | channel=\"${c.author}\" | duration=${c.durationSec}s | views=${c.viewOrScoreCount}$descPart"
             }.joinToString("\n")
 
             val langNote = when (languageMode) {
                 SearchLanguageMode.RUSSIAN_ONLY -> "Выбирай ТОЛЬКО видео на русском языке (отсекай украинские и любые иностранные ролики)."
-                SearchLanguageMode.ENGLISH_FOR_DUB -> "Выбирай ТОЛЬКО англоязычные видео, которые отлично подойдут для русской переозвучки."
+                SearchLanguageMode.ENGLISH_FOR_DUB -> "Выбирай ТОЛЬКО англоязычные видео с высокой динамикой и фан-базой, идеальные под русскую переозвучку."
                 SearchLanguageMode.ANY_LANGUAGE -> "Можно выбирать видео на русском или английском языке."
             }
 
             val prompt = """
-                Ты — главный редактор видеоконтента. Пользователь ищет видео по теме:
-                "$userFreeformPrompt"
+                Ты — главный продюсер вирального контента и скаут фан-базы.
+                Тема пользователя: "$userFreeformPrompt"
+                Актуальная мета ниши: "${nichePlan.activeMetaDescription}"
+                Топовые медийные лица/триггеры в этой нише: ${nichePlan.tierOneEntities.joinToString(", ")}
                 Правило языка: $langNote
 
-                Вот список найденных кандидатов (${candidates.size} шт.):
+                Вот список найденных видео-кандидатов (${candidates.size} шт.):
                 $catalogText
 
-                Задача:
-                1. Выбери до $limitCount лучших роликов, которые точно попадают в тему (современный живой контент, известные комики/авторы, никаких старых архивов типа Жванецкого/Петросяна/Одесских анекдотов).
-                2. Для каждого выбранного ролика напиши конкретную выжимку на русском языке ("whatsInside", до 130 символов): кто выступает, о чём именно монолог/история и почему стоит взять.
-                Верни строго JSON:
-                {"selected": [{"index": 0, "whatsInside": "Комик разгоняет жизненную историю про..."}]}
+                Твоя задача — проверить КАЖДОГО кандидата на наличие фан-базы и медийного веса (кто этот комик / игрок / автор / персонаж, популярен ли он или это никому не известный ноунейм / устаревший кринж):
+                1. Отсей откровенных ноунеймов с нулевой медийностью, старые версии игр (например CS 1.6 вместо CS2) и архивный нафталин.
+                2. Выбери до $limitCount лучших роликов, которые дадут максимум просмотров, лайков и конверсии.
+                3. Для каждого выбранного ролика укажи:
+                   - "index": номер кандидата из списка.
+                   - "cloutTier":
+                     * "TOP_FANBASE" — если в ролике известный комик/игрок/медийная личность/крупное шоу или горячий мейнстрим-тренд с мощной фан-базой.
+                     * "RISING_NICHE" — если автор/тема живая, набирает хорошие просмотры и цепляет аудиторию, хоть и не звезда первой величины.
+                     * "NONAME_LOW" — если это малоизвестный локальный автор без фан-базы (выбирай только если других нет).
+                   - "conversionScore": оценка потенциала конверсии в лайки/комменты от 1 до 100.
+                   - "entityWhoIs": Честная справка (до 95 символов) — КТО это в кадре / что за канал или шоу, насколько он популярен и почему у него есть (или нет) фанаты.
+                   - "whatsInside": Выжимка сути ролика на русском языке (до 130 символов) — о чём конкретно речь/шутка/момент внутри.
+
+                Верни СТРОГО валидный JSON:
+                {
+                  "selected": [
+                    {
+                      "index": 0,
+                      "cloutTier": "TOP_FANBASE",
+                      "conversionScore": 92,
+                      "entityWhoIs": "Популярный стендап-комик (резидент Outside Stand Up), огромная живая фан-база",
+                      "whatsInside": "Разгоняет жизненную историю про..."
+                    }
+                  ]
+                }
             """.trimIndent()
 
             val rawJson = callGeminiJson(configStore.getGeminiApiKey(), prompt)
@@ -600,19 +608,75 @@ class TopicHunterEngine(private val context: Context) {
                 for (sel in parsed.selected) {
                     if (sel.index in candidates.indices) {
                         val orig = candidates[sel.index]
+                        val tierBadge = when (sel.cloutTier.uppercase(Locale.US)) {
+                            "TOP_FANBASE" -> "🔥 ТОП ФАН-БАЗА (Высокая конверсия)"
+                            "RISING_NICHE" -> "📈 ЖИВАЯ ТЕМА / СРЕДНЯЯ МЕДИЙКА"
+                            else -> "⚠️ ЛОКАЛЬНЫЙ / МАЛОИЗВЕСТНЫЙ"
+                        }
+                        val score = sel.conversionScore.coerceIn(10, 99)
                         val summary = sel.whatsInside.trim().ifBlank { buildLocalWhatsInsideFallback(orig, languageMode) }
-                        result.add(orig.copy(aiWhatsInside = summary))
+                        val entityNote = sel.entityWhoIs.trim().ifBlank {
+                            estimateLocalCloutNote(orig, nichePlan)
+                        }
+                        result.add(
+                            orig.copy(
+                                aiWhatsInside = summary,
+                                cloutStatusLabel = "$tierBadge • 🎯 Конверсия: $score%",
+                                entityPopularityNote = entityNote,
+                                conversionScore = score
+                            )
+                        )
                     }
                 }
 
                 if (result.isNotEmpty()) {
-                    return result.distinctBy { it.id }.take(limitCount)
+                    return result
+                        .sortedByDescending { it.conversionScore }
+                        .distinctBy { it.id }
+                        .take(limitCount)
                 }
             }
-            candidates.take(limitCount).map { it.copy(aiWhatsInside = buildLocalWhatsInsideFallback(it, languageMode)) }
+            candidates.take(limitCount).map { enrichWithLocalCloutFallback(it, nichePlan, languageMode) }
         } catch (e: Exception) {
             DiagnosticLogger.log("HUNT:AI-RERANK", "Предупреждение AI-ранжирования: ${e.message?.take(100)}")
-            candidates.take(limitCount).map { it.copy(aiWhatsInside = buildLocalWhatsInsideFallback(it, languageMode)) }
+            candidates.take(limitCount).map { enrichWithLocalCloutFallback(it, nichePlan, languageMode) }
+        }
+    }
+
+    private fun enrichWithLocalCloutFallback(
+        c: DiscoveredMediaCandidate,
+        nichePlan: AdaptiveNichePlanDto,
+        languageMode: SearchLanguageMode
+    ): DiscoveredMediaCandidate {
+        val combined = "${c.title} ${c.author}".lowercase(Locale.getDefault())
+        val matchedEntity = nichePlan.tierOneEntities.firstOrNull { ent ->
+            ent.length >= 3 && combined.contains(ent.lowercase(Locale.getDefault()))
+        }
+        val views = c.viewOrScoreCount
+        val (badge, score) = when {
+            matchedEntity != null || views >= 100_000L -> "🔥 ТОП ФАН-БАЗА (Высокая конверсия)" to 90
+            views >= 20_000L -> "📈 ЖИВАЯ ТЕМА / ХОРОШИЙ ОХВАТ" to 76
+            views >= 5_000L -> "📊 СРЕДНЯЯ МЕДИЙКА" to 62
+            else -> "⚠️ МАЛОИЗВЕСТНЫЙ / НОУНЕЙМ" to 40
+        }
+        return c.copy(
+            aiWhatsInside = buildLocalWhatsInsideFallback(c, languageMode),
+            cloutStatusLabel = "$badge • 🎯 Конверсия: $score%",
+            entityPopularityNote = estimateLocalCloutNote(c, nichePlan),
+            conversionScore = score
+        )
+    }
+
+    private fun estimateLocalCloutNote(c: DiscoveredMediaCandidate, nichePlan: AdaptiveNichePlanDto): String {
+        val combined = "${c.title} ${c.author}".lowercase(Locale.getDefault())
+        val matchedEntity = nichePlan.tierOneEntities.firstOrNull { ent ->
+            ent.length >= 3 && combined.contains(ent.lowercase(Locale.getDefault()))
+        }
+        return when {
+            matchedEntity != null -> "Узнаваемый триггер ниши («$matchedEntity») на канале ${c.author} — высокая лояльность фанатов"
+            c.viewOrScoreCount >= 100_000L -> "Крупный охват (${c.viewOrScoreCount} просм.) у канала «${c.author}» — проверенная фан-база"
+            c.viewOrScoreCount >= 15_000L -> "Активная аудитория канала «${c.author}» (${c.viewOrScoreCount} просм.)"
+            else -> "Нишевый автор «${c.author}» (${c.viewOrScoreCount} просм.) — проверь момент через «Что внутри»"
         }
     }
 
@@ -626,7 +690,7 @@ class TopicHunterEngine(private val context: Context) {
         return if (snippet.length >= 15) {
             "$langTag${c.author}: $snippet"
         } else {
-            "${langTag}Выступление / ролик на канале «${c.author}» (${c.durationSec} сек, ${c.viewOrScoreCount} просм.) — жми «🧠 Что внутри», чтобы получить разбор по субтитрам с таймкодами"
+            "${langTag}Ролик на канале «${c.author}» (${c.durationSec} сек, ${c.viewOrScoreCount} просм.) — жми «🧠 Что внутри» для разбора по субтитрам с таймкодами"
         }
     }
 
@@ -789,49 +853,58 @@ class TopicHunterEngine(private val context: Context) {
     }
 
     /**
-     * Вызов AI с автоматическим обходом гео-блокировки Google Gemini на российских мобильных IP (4G без VPN).
-     * Если прямой запрос к generativelanguage.googleapis.com возвращает HTTP 400 (User location is not supported)
-     * или ключ пуст, автоматически переключается на резервный JSON AI-шлюз без гео-блока.
+     * Вызов AI с поддержкой нескольких моделей Gemini (2.5-flash -> 2.0-flash) + резервного JSON AI-шлюза.
      */
     private suspend fun callGeminiJson(apiKey: String, prompt: String): String? {
         if (apiKey.isNotBlank()) {
-            try {
-                val endpoint =
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
-                val payload = GeminiGenerateRequest(
-                    contents = listOf(
-                        GeminiContent(parts = listOf(GeminiPart(text = prompt)))
-                    ),
-                    generationConfig = GeminiGenerationConfig(
-                        temperature = 0.25,
-                        responseMimeType = "application/json"
+            val models = listOf("gemini-2.5-flash", "gemini-2.0-flash")
+            for (modelName in models) {
+                try {
+                    val endpoint =
+                        "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
+                    val payload = GeminiGenerateRequest(
+                        contents = listOf(
+                            GeminiContent(parts = listOf(GeminiPart(text = prompt)))
+                        ),
+                        generationConfig = GeminiGenerationConfig(
+                            temperature = 0.25,
+                            responseMimeType = "application/json"
+                        )
                     )
-                )
-                val httpResp = httpClient.post(endpoint) {
-                    contentType(ContentType.Application.Json)
-                    setBody(payload)
+                    val httpResp = httpClient.post(endpoint) {
+                        contentType(ContentType.Application.Json)
+                        setBody(payload)
+                    }
+                    val rawBody = httpResp.bodyAsText()
+                    if (httpResp.status.isSuccess()) {
+                        val parsed = jsonFormat.decodeFromString<GeminiGenerateResponse>(rawBody)
+                        val text = parsed.candidates.firstOrNull()
+                            ?.content?.parts?.firstOrNull()?.text
+                            ?.replace("```json", "")
+                            ?.replace("```", "")
+                            ?.trim()
+                        if (!text.isNullOrBlank()) {
+                            val firstBrace = text.indexOf('{')
+                            val lastBrace = text.lastIndexOf('}')
+                            return if (firstBrace >= 0 && lastBrace > firstBrace) {
+                                text.substring(firstBrace, lastBrace + 1)
+                            } else {
+                                text
+                            }
+                        }
+                    } else {
+                        DiagnosticLogger.log(
+                            "AI-CALL",
+                            "Модель $modelName вернула HTTP ${httpResp.status.value} -> пробуем следующую модель..."
+                        )
+                    }
+                } catch (e: Exception) {
+                    DiagnosticLogger.log("AI-CALL", "Предупреждение вызова $modelName: ${e.message?.take(60)}")
                 }
-                val rawBody = httpResp.bodyAsText()
-                if (httpResp.status.isSuccess()) {
-                    val parsed = jsonFormat.decodeFromString<GeminiGenerateResponse>(rawBody)
-                    val text = parsed.candidates.firstOrNull()
-                        ?.content?.parts?.firstOrNull()?.text
-                        ?.replace("```json", "")
-                        ?.replace("```", "")
-                        ?.trim()
-                    if (!text.isNullOrBlank()) return text
-                } else {
-                    DiagnosticLogger.log(
-                        "AI-GEO",
-                        "Прямой Gemini API вернул HTTP ${httpResp.status.value} (без VPN в РФ блокируется IP) -> переключаюсь на резервный AI-шлюз без гео-блока..."
-                    )
-                }
-            } catch (e: Exception) {
-                DiagnosticLogger.log("AI-GEO", "Прямой Gemini недоступен (${e.message?.take(60)}) -> резервный AI-шлюз...")
             }
         }
 
-        // Geo-unblocked fallback AI endpoint (works directly on 4G in Russia without VPN)
+        // Резервный AI-шлюз на случай лимитов квоты или отсутствия ключа
         return try {
             val fallbackBody = kotlinx.serialization.json.buildJsonObject {
                 put("model", kotlinx.serialization.json.JsonPrimitive("openai"))
@@ -875,14 +948,54 @@ class TopicHunterEngine(private val context: Context) {
         }
     }
 
-    private fun containsArchaicComedyBlacklist(text: String): Boolean {
+    private fun containsBlacklistedTerm(text: String, blacklist: List<String>): Boolean {
+        if (blacklist.isEmpty()) return false
         val lower = text.lowercase(Locale.getDefault())
-        val banned = listOf(
+        return blacklist.any { term ->
+            val t = term.trim().lowercase(Locale.getDefault())
+            t.length >= 2 && lower.contains(t)
+        }
+    }
+
+    /**
+     * Базовый фильтр мёртвых версий игр (например CS 1.6 вместо CS2, если пользователь сам не просил 1.6)
+     * и старой телевизионной эстрады, дополняющий динамический AI-список.
+     */
+    private fun universalDeadContentBlacklist(userPrompt: String): List<String> {
+        val lowerPrompt = userPrompt.lowercase(Locale.getDefault())
+        val list = mutableListOf(
             "жванецкий", "петросян", "аншлаг", "одесский юмор", "услышано в одессе",
-            "анекдот по поводу", "кривое зеркало", "смехопанорама", "шифрин", "винокур",
-            "задорнов", "альтов", "камеди вумен", "уральские пельмени"
+            "анекдот по поводу", "кривое зеркало", "смехопанорама", "шифрин", "винокур"
         )
-        return banned.any { lower.contains(it) }
+        if (!lowerPrompt.contains("1.6") && !lowerPrompt.contains("source")) {
+            list.addAll(listOf("cs 1.6", "кс 1.6", "counter-strike 1.6", "cs source", "кс соурс", "condition zero"))
+        }
+        if (!lowerPrompt.contains("dota 1") && !lowerPrompt.contains("дота 1")) {
+            list.addAll(listOf("dota 1", "дота 1", "allstars"))
+        }
+        return list
+    }
+
+    /**
+     * Нормализует разговорные названия ниш в актуальную современную мету (например "по КСке" -> "CS2").
+     */
+    private fun normalizeLegacyNicheTerms(userPrompt: String, languageMode: SearchLanguageMode): String {
+        var normalized = userPrompt
+        val lower = normalized.lowercase(Locale.getDefault())
+        if ((lower.contains("кск") || Regex("""\bкс\b""").containsMatchIn(lower) || Regex("""\bcs\b""").containsMatchIn(lower)) &&
+            !lower.contains("cs2") && !lower.contains("кс2") && !lower.contains("1.6")
+        ) {
+            normalized = normalized
+                .replace(Regex("""(?i)по\s+кске"""), "CS2")
+                .replace(Regex("""(?i)в\s+кске"""), "CS2")
+                .replace(Regex("""(?i)\bкска\b"""), "CS2")
+                .replace(Regex("""(?i)\bкс\b"""), "CS2")
+                .replace(Regex("""(?i)\bcs\b"""), "CS2")
+        }
+        if (languageMode == SearchLanguageMode.ENGLISH_FOR_DUB && !normalized.any { it in 'a'..'z' || it in 'A'..'Z' }) {
+            normalized = "$normalized english"
+        }
+        return sanitizeQuery(normalized)
     }
 
     /**
@@ -917,19 +1030,21 @@ class TopicHunterEngine(private val context: Context) {
         }
     }
 
-    private fun scoreCandidateRelevance(c: DiscoveredMediaCandidate, userQuery: String): Double {
+    private fun scoreCandidateRelevance(
+        c: DiscoveredMediaCandidate,
+        userQuery: String,
+        nichePlan: AdaptiveNichePlanDto
+    ): Double {
         val lowerTitle = c.title.lowercase(Locale.getDefault())
         val lowerAuthor = c.author.lowercase(Locale.getDefault())
-        var score = kotlin.math.ln((c.viewOrScoreCount.coerceAtLeast(100L)).toDouble()) * 10.0
+        var score = kotlin.math.ln((c.viewOrScoreCount.coerceAtLeast(100L)).toDouble()) * 12.0
 
-        val topModernComediansAndShows = listOf(
-            "щербаков", "чебатков", "орлов", "коваль", "бебуришвили", "дорохов", "абрамов",
-            "сабуров", "дедищев", "соболев", "мусагалиев", "станkeвич", "косицын", "амарян",
-            "outside stand up", "standup club", "стендап клуб", "разгоны", "чбд", "монолог",
-            "matt rife", "andrew schulz", "theo von", "bill burr", "dave chappelle", "crowd work"
-        )
-        if (topModernComediansAndShows.any { lowerTitle.contains(it) || lowerAuthor.contains(it) }) {
-            score += 65.0
+        // Адаптивный бонус за попадание в главных медийных персон / триггеров фан-базы этой ниши
+        for (entity in nichePlan.tierOneEntities) {
+            val eLow = entity.trim().lowercase(Locale.getDefault())
+            if (eLow.length >= 3 && (lowerTitle.contains(eLow) || lowerAuthor.contains(eLow))) {
+                score += 75.0
+            }
         }
 
         val queryWords = userQuery.lowercase(Locale.getDefault())
@@ -944,7 +1059,7 @@ class TopicHunterEngine(private val context: Context) {
 
     private suspend fun searchYouTubeByTags(
         queryTags: String,
-        userOriginalTopic: String = queryTags,
+        nichePlan: AdaptiveNichePlanDto = AdaptiveNichePlanDto(),
         sortOrder: ContentSortOrder = ContentSortOrder.RELEVANCE,
         period: SearchTimePeriod = SearchTimePeriod.MONTH,
         languageMode: SearchLanguageMode = SearchLanguageMode.RUSSIAN_ONLY,
@@ -959,21 +1074,19 @@ class TopicHunterEngine(private val context: Context) {
             queryTags
         }
 
-        // Minimum views threshold so 225-view dead videos from 6 years ago never pass!
+        // Порог просмотров, чтобы мёртвые ролики от ноунеймов (225 просмотров) не пролезали в выдачу
         val minRequiredViews = when (period) {
-            SearchTimePeriod.DAY -> 150L
-            SearchTimePeriod.WEEK -> 700L
-            else -> 2500L
+            SearchTimePeriod.DAY -> 200L
+            SearchTimePeriod.WEEK -> 900L
+            else -> 3000L
         }
 
-        val isComedySearch = listOf("стендап", "комик", "юмор", "монолог", "диалог", "истори", "рассказ")
-            .any { userOriginalTopic.lowercase().contains(it) || finalQuery.lowercase().contains(it) }
-
+        val effectiveBlacklist = (nichePlan.outdatedBlacklist + universalDeadContentBlacklist(queryTags)).distinct()
         val results = mutableListOf<DiscoveredMediaCandidate>()
 
         try {
-            // Build server-side YouTube Search URL with exact `sp=` upload-date filter when period is selected!
-            // EgQIAhAB = Today (24h), EgQIAxAB = This week, EgQIBBAB = This month, EgQIBRAB = This year
+            // Серверный фильтр даты загрузки YouTube (sp=):
+            // EgQIAhAB = За 24 часа, EgQIAxAB = За неделю, EgQIBBAB = За месяц, EgQIBRAB = За год
             val spParam = when {
                 period == SearchTimePeriod.DAY -> "EgQIAhAB"
                 period == SearchTimePeriod.WEEK -> "EgQIAxAB"
@@ -1011,11 +1124,18 @@ class TopicHunterEngine(private val context: Context) {
 
             for (line in lines) {
                 try {
-                    // Reject old multi-year videos if user requested DAY / WEEK / MONTH
+                    val lowerLine = line.lowercase(Locale.getDefault())
+                    // Жёсткий контроль свежести по сырому ответу YouTube
                     if (period == SearchTimePeriod.DAY || period == SearchTimePeriod.WEEK || period == SearchTimePeriod.MONTH) {
-                        val lowerLine = line.lowercase(Locale.getDefault())
                         if (lowerLine.contains("years ago") || lowerLine.contains("year ago") ||
                             lowerLine.contains("лет назад") || lowerLine.contains("года назад") || lowerLine.contains("год назад")
+                        ) {
+                            continue
+                        }
+                    }
+                    if (period == SearchTimePeriod.DAY || period == SearchTimePeriod.WEEK) {
+                        if (lowerLine.contains("months ago") || lowerLine.contains("month ago") ||
+                            lowerLine.contains("месяцев назад") || lowerLine.contains("месяца назад") || lowerLine.contains("месяц назад")
                         ) {
                             continue
                         }
@@ -1028,13 +1148,13 @@ class TopicHunterEngine(private val context: Context) {
                     val author = item.uploader ?: item.channel ?: "YouTube"
                     val views = item.viewCount ?: 0L
 
-                    // 1. Filter out dead low-view videos (e.g. 225 views)
+                    // 1. Отсев мёртвых роликов с мизерными просмотрами
                     if (views in 1 until minRequiredViews) continue
 
-                    // 2. Filter out archaic boomer humor if searching standup/stories
-                    if (isComedySearch && containsArchaicComedyBlacklist("$title $author")) continue
+                    // 2. Адаптивный отсев устаревших версий (например CS 1.6) и старой эстрады
+                    if (containsBlacklistedTerm("$title $author", effectiveBlacklist)) continue
 
-                    // 3. Enforce language filter (Russian only vs English for dubbing)
+                    // 3. Проверка языка (🇷🇺 Только Русский vs 🇺🇸 Английский под переозвучку)
                     if (!matchesLanguageFilter(title, author, languageMode)) continue
 
                     val rawUrl = item.webpageUrl ?: item.url ?: ""
@@ -1064,7 +1184,7 @@ class TopicHunterEngine(private val context: Context) {
             }
             DiagnosticLogger.log("HUNT:YT", "YouTube нашёл ${results.size} подходящих роликов по запросу '$finalQuery' (период=${period.name}, язык=${languageMode.name})")
 
-            // If strict period filter (e.g. MONTH) returned 0 videos for a very narrow query, fallback to YEAR filter (still banning multi-year junk!)
+            // Если за узкий период (например за месяц) по конкретному имени 0 роликов — расширяем до года, но по-прежнему баним многолетнее старьё и blacklist!
             if (results.isEmpty() && (period == SearchTimePeriod.DAY || period == SearchTimePeriod.WEEK || period == SearchTimePeriod.MONTH)) {
                 val fallbackUrl = "https://www.youtube.com/results?search_query=$encodedQ&sp=EgQIBRAB"
                 val fbReq = YoutubeDLRequest(fallbackUrl).apply {
@@ -1084,8 +1204,8 @@ class TopicHunterEngine(private val context: Context) {
                         val title = item.title
                         val author = item.uploader ?: item.channel ?: "YouTube"
                         val views = item.viewCount ?: 0L
-                        if (views in 1 until 3000L) continue
-                        if (isComedySearch && containsArchaicComedyBlacklist("$title $author")) continue
+                        if (views in 1 until 3500L) continue
+                        if (containsBlacklistedTerm("$title $author", effectiveBlacklist)) continue
                         if (!matchesLanguageFilter(title, author, languageMode)) continue
                         val dur = item.duration?.toInt() ?: 60
                         if (dur in minDurationSec..maxDurationSec) {
@@ -1136,7 +1256,7 @@ class TopicHunterEngine(private val context: Context) {
                         val author = item.uploaderName ?: "YouTube"
                         val views = item.views ?: 0L
                         if (views in 1 until minRequiredViews) continue
-                        if (isComedySearch && containsArchaicComedyBlacklist("$title $author")) continue
+                        if (containsBlacklistedTerm("$title $author", effectiveBlacklist)) continue
                         if (!matchesLanguageFilter(title, author, languageMode)) continue
                         val dur = item.duration ?: 45
                         if (dur in minDurationSec..maxDurationSec) {
@@ -1245,52 +1365,6 @@ class TopicHunterEngine(private val context: Context) {
         }
     }
 
-    suspend fun listAutopilotSubscriptions(): List<AutopilotTagSubscription> = stateMutex.withLock {
-        if (!subscriptionsFile.exists()) return@withLock emptyList()
-        try {
-            jsonFormat.decodeFromString<List<AutopilotTagSubscription>>(subscriptionsFile.readText())
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
-
-    suspend fun addAutopilotSubscription(sub: AutopilotTagSubscription): List<AutopilotTagSubscription> =
-        stateMutex.withLock {
-            val current = if (subscriptionsFile.exists()) {
-                try {
-                    jsonFormat.decodeFromString<List<AutopilotTagSubscription>>(subscriptionsFile.readText())
-                        .toMutableList()
-                } catch (_: Exception) {
-                    mutableListOf()
-                }
-            } else {
-                mutableListOf()
-            }
-            current.removeAll { it.queryTags.equals(sub.queryTags, ignoreCase = true) }
-            current.add(sub)
-            subscriptionsFile.writeText(jsonFormat.encodeToString(current))
-            current
-        }
-
-    suspend fun removeAutopilotSubscription(indexOrTag: String): List<AutopilotTagSubscription> =
-        stateMutex.withLock {
-            if (!subscriptionsFile.exists()) return@withLock emptyList()
-            val current = try {
-                jsonFormat.decodeFromString<List<AutopilotTagSubscription>>(subscriptionsFile.readText())
-                    .toMutableList()
-            } catch (_: Exception) {
-                mutableListOf()
-            }
-            val idx = indexOrTag.toIntOrNull()
-            if (idx != null && idx in 1..current.size) {
-                current.removeAt(idx - 1)
-            } else {
-                current.removeAll { it.queryTags.equals(indexOrTag, ignoreCase = true) }
-            }
-            subscriptionsFile.writeText(jsonFormat.encodeToString(current))
-            current
-        }
-
     private suspend fun loadSeenIds(): Set<String> = stateMutex.withLock {
         if (!seenIdsFile.exists()) return@withLock emptySet()
         seenIdsFile.readLines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()
@@ -1341,7 +1415,7 @@ class TopicHunterEngine(private val context: Context) {
                 """.trimIndent()
                 val rawJson = callGeminiJson(apiKey, prompt)
                 if (!rawJson.isNullOrBlank()) {
-                    val parsed = jsonFormat.decodeFromString<AiQueryExpansionDto>(rawJson)
+                    val parsed = jsonFormat.decodeFromString<AdaptiveNichePlanDto>(rawJson)
                     val aiQueries = parsed.queries.map { sanitizeQuery(it) }.filter { it.isNotBlank() }
                     if (aiQueries.isNotEmpty()) {
                         farmQueries.clear()

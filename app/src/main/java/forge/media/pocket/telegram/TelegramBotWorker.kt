@@ -579,7 +579,7 @@ class TelegramBotWorker(
     private suspend fun executeTagSearchAndSendLinks(chatId: Long, state: PendingHuntFilterState) {
         sendMessage(
             chatId,
-            "🔎 Расширяю тему «${state.queryTags}» (подключаю популярные похожие запросы, комиков/авторов и автоподсказки YouTube), язык: ${state.languageMode.label}, период: ${state.period.label}..."
+            "🔎 Анализирую актуальную мету и фан-базу темы «${state.queryTags}» (отсекаю мёртвые версии и ноунеймов, подключаю топ-персон и живые запросы YouTube), язык: ${state.languageMode.label}, период: ${state.period.label}..."
         )
 
         enqueueHardwareTask("search", "AI Smart Search for '${state.queryTags}'") {
@@ -607,7 +607,7 @@ class TelegramBotWorker(
                 batchTopics[batchId] = state.queryTags
 
                 val msgText = buildString {
-                    append("🎯 Найдено ${candidates.size} видео по теме:\n«${state.queryTags}»\n\n")
+                    append("🎯 Найдено ${candidates.size} видео с проверкой фан-базы и конверсии по теме:\n«${state.queryTags}»\n\n")
                     append("• Нажми «🧠 Что внутри #N», чтобы за 3 сек прочитать полную выжимку по субтитрам и узнать точные таймкоды лучших моментов (без скачивания видео!).\n")
                     append("• Или сразу жми «✅ Взять #N (1080p)», чтобы закинуть исходник в Студию телефона:\n\n")
 
@@ -617,6 +617,12 @@ class TelegramBotWorker(
                         val viewsStr = formatViewsCount(c.viewOrScoreCount)
                         append("$num. 📌 ${c.title}\n")
                         append("   ⏱ $durStr • 👁 $viewsStr • 👤 ${c.author}\n")
+                        if (c.cloutStatusLabel.isNotBlank()) {
+                            append("   📊 Статус: ${c.cloutStatusLabel}\n")
+                        }
+                        if (c.entityPopularityNote.isNotBlank()) {
+                            append("   🌟 Медийка/Фан-база: ${c.entityPopularityNote}\n")
+                        }
                         if (c.aiWhatsInside.isNotBlank()) {
                             append("   🧠 Что внутри: ${c.aiWhatsInside}\n")
                         }
@@ -1262,10 +1268,35 @@ class TelegramBotWorker(
                             isPreviewPass = false
                         )
                         val galleryFile = hardwareEngine.saveRenderedVideoToGallery(rendered, item.title)
+                        val meta = geminiClient.generateMetadataIfEnabled(
+                            enabled = cfg.enableAiMetadataGeneration,
+                            sourceUrl = item.sourceUrl,
+                            originalTitle = item.title,
+                            originalAuthor = item.author,
+                            sourceTags = item.sourceTags,
+                            transcriptText = item.aiSummary,
+                            adConfig = cfg.adLayer
+                        )
+                        val captionText = buildString {
+                            append("✅ Готовый ролик сохранён в Галерею телефона (${galleryFile.name})!\n")
+                            if (meta != null && meta.titles.isNotEmpty()) {
+                                append("\n🔥 Идеи названий:\n")
+                                meta.titles.take(3).forEachIndexed { i, t ->
+                                    append("${i + 1}) $t\n")
+                                }
+                                if (meta.hashtags.isNotEmpty()) {
+                                    append("\n🏷 ").append(meta.hashtags.joinToString(" ")).append("\n")
+                                }
+                                if (meta.pinnedComment.isNotBlank()) {
+                                    append("📌 Закреп: ").append(meta.pinnedComment).append("\n")
+                                }
+                            }
+                            append("🔗 Оригинал: ").append(item.sourceUrl)
+                        }
                         sendUncompressedDocument(
                             chatId = chatId,
                             file = rendered,
-                            caption = "✅ Готовый ролик сохранён в Галерею телефона (${galleryFile.name})!\n🔗 Оригинал: ${item.sourceUrl}"
+                            caption = captionText
                         )
                         rendered.delete()
                     } catch (e: Exception) {

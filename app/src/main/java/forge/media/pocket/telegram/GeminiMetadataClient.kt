@@ -143,11 +143,22 @@ class GeminiMetadataClient(private val configStore: NodeConfigStore) {
                 )
             }.body()
 
-            val rawJson = response.candidates.firstOrNull()
+            val rawText = response.candidates.firstOrNull()
                 ?.content?.parts?.firstOrNull()?.text
+                ?.replace("```json", "")
+                ?.replace("```", "")
+                ?.trim()
                 ?: return@withContext null
 
-            jsonFormat.decodeFromString<GeneratedSocialMetadata>(rawJson)
+            val firstBrace = rawText.indexOf('{')
+            val lastBrace = rawText.lastIndexOf('}')
+            val cleanJson = if (firstBrace >= 0 && lastBrace > firstBrace) {
+                rawText.substring(firstBrace, lastBrace + 1)
+            } else {
+                rawText
+            }
+
+            jsonFormat.decodeFromString<GeneratedSocialMetadata>(cleanJson)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to generate Gemini metadata", e)
             null

@@ -120,34 +120,6 @@ data class ModularRenderConfig(
             subtitleLayer = SubtitleLayerConfig(enabled = false),
             dspLayer = AntiDetectDspLayerConfig(enabled = true)
         )
-
-        fun presetBlurredFrame() = ModularRenderConfig(
-            layoutLayer = VideoLayoutLayer.BLURRED_BG_FRAME,
-            enableSmartFaceCrop = false,
-            subtitleLayer = SubtitleLayerConfig(enabled = false),
-            dspLayer = AntiDetectDspLayerConfig(enabled = true)
-        )
-
-        fun presetFullscreenEdit() = ModularRenderConfig(
-            layoutLayer = VideoLayoutLayer.FULLSCREEN_EDIT,
-            enableSmartFaceCrop = false,
-            subtitleLayer = SubtitleLayerConfig(enabled = false),
-            dspLayer = AntiDetectDspLayerConfig(enabled = true)
-        )
-
-        fun presetBrainrotStory() = ModularRenderConfig(
-            layoutLayer = VideoLayoutLayer.BRAINROT_VOICEOVER,
-            enableSmartFaceCrop = false,
-            subtitleLayer = SubtitleLayerConfig(enabled = true),
-            dspLayer = AntiDetectDspLayerConfig(enabled = true)
-        )
-
-        fun presetDistortedOriginal() = ModularRenderConfig(
-            layoutLayer = VideoLayoutLayer.DISTORTED_ORIGINAL,
-            enableSmartFaceCrop = false,
-            subtitleLayer = SubtitleLayerConfig(enabled = false),
-            dspLayer = AntiDetectDspLayerConfig(enabled = true)
-        )
     }
 }
 
@@ -272,19 +244,6 @@ class FFmpegHardwareEngine(private val context: Context) {
         DiagnosticLogger.log("RENDER", "✅ Программный рендер готов: ${outFile.length() / 1024} KB")
         outFile
     }
-
-    suspend fun extractCleanAudioTrack(primaryVideoFile: File, outputM4a: File): Boolean =
-        suspendCancellableCoroutine { cont ->
-            val cmd = buildString {
-                append("-hide_banner -loglevel error -nostdin -y ")
-                append("-i \"${primaryVideoFile.absolutePath}\" ")
-                append("-vn -c:a aac -b:a 192k -ar 48000 ")
-                append("\"${outputM4a.absolutePath}\"")
-            }
-            FFmpegKit.executeAsync(cmd) { session ->
-                if (cont.isActive) cont.resume(ReturnCode.isSuccess(session.returnCode))
-            }
-        }
 
     /**
      * Инструмент разделения звуковых дорожек (3 Stems):

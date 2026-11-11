@@ -110,8 +110,6 @@ class NodeConfigStore(private val context: Context) {
         private const val KEY_BOT_TOKEN = "telegram_bot_token"
         private const val KEY_GEMINI_API_KEY = "gemini_api_key"
         private const val KEY_ALLOWED_CHAT_ID = "allowed_chat_id"
-        private const val KEY_BANNER_TEXT = "custom_banner_text"
-        private const val KEY_PROMO_URL = "sponsor_promo_url"
     }
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -146,35 +144,6 @@ class NodeConfigStore(private val context: Context) {
     fun setAllowedChatId(chatId: String) {
         prefs.edit().putString(KEY_ALLOWED_CHAT_ID, chatId.trim()).apply()
     }
-
-    fun getCustomBannerText(): String {
-        return prefs.getString(KEY_BANNER_TEXT, null)
-            ?.takeIf { it.isNotBlank() }
-            ?: "SPONSORED • ССЫЛКА В ЗАКРЕПЕ"
-    }
-
-    fun getDefaultBannerText(): String = getCustomBannerText()
-
-    fun setCustomBannerText(text: String) {
-        prefs.edit().putString(KEY_BANNER_TEXT, text.trim()).apply()
-    }
-
-    fun getSponsorPromoUrl(): String {
-        return prefs.getString(KEY_PROMO_URL, "") ?: ""
-    }
-
-    fun getDefaultPromoUrl(): String = getSponsorPromoUrl()
-
-    fun setSponsorPromoUrl(url: String) {
-        prefs.edit().putString(KEY_PROMO_URL, url.trim()).apply()
-    }
-
-    fun getMidrollVideoFile(): File? {
-        val f = File(context.filesDir, "ad_assets/midroll.mp4")
-        return if (f.exists() && f.length() > 0L) f else null
-    }
-
-    fun getSavedMidrollFile(): File? = getMidrollVideoFile()
 
     fun getYoutubeCookiesFile(): File? {
         val f = File(context.filesDir, "youtube_cookies.txt")
